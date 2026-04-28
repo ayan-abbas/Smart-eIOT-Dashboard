@@ -1,0 +1,2 @@
+### Get Device State
+GET https://itya5y2blk.execute-api.ap-south-1.amazonaws.com/default/device/state/1?username=sa3421@srmist.edu.in&password=password

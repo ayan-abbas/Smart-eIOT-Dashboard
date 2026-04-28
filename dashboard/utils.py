@@ -107,7 +107,7 @@ def _read_sql(query: str, params: dict | None = None) -> pd.DataFrame:
 
 def authenticate_user(username: str, password: str) -> dict | None:
     """
-    Returns dict {username, role} on success, None on failure.
+    Returns dict {username, role, view_all_devices} on success, None on failure.
     """
     t0 = time.perf_counter()
     conn = cursor = None
@@ -115,12 +115,16 @@ def authenticate_user(username: str, password: str) -> dict | None:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute(
-            "SELECT password, role FROM users WHERE username = %s", (username,)
+            "SELECT password, role, view_all_devices FROM users WHERE username = %s", (username,)
         )
         row = cursor.fetchone()
         if row and row["password"] == password:
             log.info("authenticate_user(%s) OK [%.0f ms]", username, (time.perf_counter() - t0) * 1000)
-            return {"username": username, "role": row["role"]}
+            return {
+                "username": username, 
+                "role": row["role"],
+                "view_all_devices": bool(row.get("view_all_devices", 0))
+            }
         log.info("authenticate_user(%s) FAIL [%.0f ms]", username, (time.perf_counter() - t0) * 1000)
         return None
     except Exception as e:
@@ -131,7 +135,7 @@ def authenticate_user(username: str, password: str) -> dict | None:
         if conn:   conn.close()
 
 
-def create_user(username: str, password: str, role: str = "viewer") -> bool:
+def create_user(username: str, password: str, role: str = "viewer", view_all_devices: bool = False) -> bool:
     if role not in ROLES:
         raise ValueError(f"Invalid role: {role!r}")
     t0 = time.perf_counter()
@@ -140,11 +144,12 @@ def create_user(username: str, password: str, role: str = "viewer") -> bool:
         conn = get_connection()
         cursor = conn.cursor(buffered=True)
         cursor.execute(
-            "INSERT INTO users (username, password, role) VALUES (%s, %s, %s)",
-            (username, password, role)
+            "INSERT INTO users (username, password, role, view_all_devices) VALUES (%s, %s, %s, %s)",
+            (username, password, role, int(view_all_devices))
         )
         conn.commit()
-        log.info("create_user(%s, role=%s) OK [%.0f ms]", username, role, (time.perf_counter() - t0) * 1000)
+        log.info("create_user(%s, role=%s, view_all=%s) OK [%.0f ms]", 
+                 username, role, view_all_devices, (time.perf_counter() - t0) * 1000)
         return True
     except mysql.connector.Error as e:
         if e.errno == 1062:
@@ -175,6 +180,23 @@ def update_user_role(username: str, new_role: str) -> bool:
         if conn:   conn.close()
 
 
+def update_user_view_all(username: str, view_all: bool) -> bool:
+    """Update the view_all_devices permission for a user."""
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("UPDATE users SET view_all_devices = %s WHERE username = %s", (int(view_all), username))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        log.error("update_user_view_all error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
 def delete_user(username: str) -> bool:
     conn = cursor = None
     try:
@@ -192,12 +214,12 @@ def delete_user(username: str) -> bool:
 
 
 def get_all_users() -> list[dict]:
-    """Admin only: returns all users with their roles."""
+    """Admin only: returns all users with their roles and permissions."""
     conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True, buffered=True)
-        cursor.execute("SELECT username, role FROM users ORDER BY role, username")
+        cursor.execute("SELECT username, role, view_all_devices FROM users ORDER BY role, username")
         return cursor.fetchall()
     except Exception as e:
         log.error("get_all_users error: %s", e)
@@ -209,9 +231,10 @@ def get_all_users() -> list[dict]:
 
 # ─── DEVICES ──────────────────────────────────────────────────────────────────
 
-def get_devices(username: str, is_admin: bool = False):
+def get_devices(username: str, is_admin: bool = False, view_all: bool = False):
     """
     Admin sees all devices across all users.
+    Users with view_all permission see all devices.
     Regular user sees only their own.
     Returns list of (deviceid, groupid, state, owner_username).
     """
@@ -220,7 +243,7 @@ def get_devices(username: str, is_admin: bool = False):
     try:
         conn = get_connection()
         cursor = conn.cursor(buffered=True)
-        if is_admin:
+        if is_admin or view_all:
             cursor.execute(
                 "SELECT deviceid, groupid, state, username FROM devices ORDER BY deviceid"
             )
@@ -230,8 +253,8 @@ def get_devices(username: str, is_admin: bool = False):
                 (username,)
             )
         devices = cursor.fetchall()
-        log.info("get_devices(%s, admin=%s) → %d rows [%.0f ms]",
-                 username, is_admin, len(devices), (time.perf_counter() - t0) * 1000)
+        log.info("get_devices(%s, admin=%s, view_all=%s) → %d rows [%.0f ms]",
+                 username, is_admin, view_all, len(devices), (time.perf_counter() - t0) * 1000)
         return devices
     except Exception as e:
         log.error("get_devices error: %s", e)
@@ -285,13 +308,13 @@ def delete_device(username: str, deviceid: int) -> bool:
 
 # ─── GROUPS ───────────────────────────────────────────────────────────────────
 
-def get_groups(username: str, is_admin: bool = False):
+def get_groups(username: str, is_admin: bool = False, view_all: bool = False):
     t0 = time.perf_counter()
     conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(buffered=True)
-        if is_admin:
+        if is_admin or view_all:
             cursor.execute("SELECT groupid, state, username FROM device_groups ORDER BY groupid")
         else:
             cursor.execute(

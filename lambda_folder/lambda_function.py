@@ -1,11 +1,14 @@
 import mysql.connector
 import json
+from datetime import datetime, timezone, timedelta
 
 def lambda_handler(event, context):
     print(event)
 
     method = event["requestContext"]["http"]["method"]
-    path = event["rawPath"]
+    path = event["rawPath"].replace("/default", "", 1)
+    print(f"METHOD: {method}, PATH: {path}")  # add this
+
 
 # POST /device/data
     if method == "POST" and path == "/device/data":
@@ -25,7 +28,8 @@ def lambda_handler(event, context):
                 port=3306,
                 user="admin",
                 password="AyansDataBase",
-                database="eiot"
+                database="eiot",
+                ssl_disabled=False
             )
 
             cursor = conn.cursor()
@@ -58,13 +62,22 @@ def lambda_handler(event, context):
                     "body": json.dumps({"error": "Forbidden"})
                 }
 
-            # Insert power data
+            # Insert power data into normalized table
+            # Use IST timezone (UTC+5:30)
+            IST = timezone(timedelta(hours=5, minutes=30))
+            now = datetime.now(IST).replace(tzinfo=None)
+            
+            print(f"Inserting data: time={now}, deviceid={device_id}, power={wattage}")
+            
             cursor.execute(
-                "INSERT INTO myPowerUsage (power_consumption) VALUES (%s)",
-                (wattage,)
+                "INSERT INTO power_usage_normalized (time, deviceid, power) VALUES (%s, %s, %s)",
+                (now, device_id, wattage)
             )
 
             conn.commit()
+            cursor.close()
+            
+            print(f"Data committed successfully for device {device_id}")
 
             return {
                 "statusCode": 200,
@@ -99,11 +112,12 @@ def lambda_handler(event, context):
 
         try:
             conn = mysql.connector.connect(
-                host="eiot.cu5iw2g8er81.us-east-1.rds.amazonaws.com",
+                host="eiot.c7eqmkyyitqo.ap-south-1.rds.amazonaws.com",
                 port=3306,
                 user="admin",
                 password="AyansDataBase",
-                database="eiot"
+                database="eiot",
+                ssl_disabled=False
             )
 
             cursor = conn.cursor()

@@ -49,6 +49,7 @@ _DEFAULTS = {
     "logged_in":        False,
     "username":         None,
     "role":             None,
+    "view_all_devices": False,
     "selected_device":  None,
     "auto_refresh":     False,
 }
@@ -65,8 +66,8 @@ def is_viewer()   -> bool: return True
 
 # ─── CACHED DATA ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=30)
-def cached_get_devices(username, admin):
-    return utils.get_devices(username, is_admin=admin)
+def cached_get_devices(username, admin, view_all):
+    return utils.get_devices(username, is_admin=admin, view_all=view_all)
 
 @st.cache_data(ttl=30)
 def cached_get_latest_power():
@@ -79,8 +80,8 @@ def cached_device_power(deviceid, start_iso, end_iso):
     return utils.get_device_power_usage(deviceid, start, end)
 
 @st.cache_data(ttl=30)
-def cached_get_groups(username, admin):
-    return utils.get_groups(username, is_admin=admin)
+def cached_get_groups(username, admin, view_all):
+    return utils.get_groups(username, is_admin=admin, view_all=view_all)
 
 @st.cache_data(ttl=60)
 def cached_group_power(username, groupid, start_iso, end_iso, admin):
@@ -304,6 +305,10 @@ def _inject_global_css():
     header {visibility: hidden !important;}
     .stDeployButton {display: none !important;}
     [data-testid="stToolbar"] {display: none !important;}
+    
+    /* Hide form submit helper text */
+    .stForm [data-testid="stFormSubmitButton"] + div {display: none !important;}
+    .stForm small {display: none !important;}
     </style>
     """, unsafe_allow_html=True)
 
@@ -394,18 +399,22 @@ def login_page():
 
     col = st.columns([1, 1.2, 1])[1]
     with col:
-        username = st.text_input("Username", placeholder="your@email.com")
-        password = st.text_input("Password", type="password", placeholder="••••••••")
-        btn_label = "Sign In" if pool_ready else "Connecting to DB…"
-        if st.button(btn_label, disabled=not pool_ready, type="primary", use_container_width=True):
-            result = utils.authenticate_user(username, password)
-            if result:
-                st.session_state.logged_in = True
-                st.session_state.username  = result["username"]
-                st.session_state.role      = result["role"]
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="your@email.com")
+            password = st.text_input("Password", type="password", placeholder="••••••••")
+            btn_label = "Sign In" if pool_ready else "Connecting to DB…"
+            submitted = st.form_submit_button(btn_label, disabled=not pool_ready, type="primary", use_container_width=True)
+            
+            if submitted:
+                result = utils.authenticate_user(username, password)
+                if result:
+                    st.session_state.logged_in = True
+                    st.session_state.username  = result["username"]
+                    st.session_state.role      = result["role"]
+                    st.session_state.view_all_devices = result.get("view_all_devices", False)
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials")
         st.caption("Account creation is managed by an administrator.")
 
 
@@ -431,7 +440,7 @@ def device_page(start_dt: datetime.datetime, end_dt: datetime.datetime):
     if st.session_state.auto_refresh:
         st_autorefresh(interval=5000, key="refresh")
 
-    devices    = cached_get_devices(st.session_state.username, is_admin())
+    devices    = cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
     latest_pwr = cached_get_latest_power()
     devices    = sorted(devices, key=lambda x: x[0])
     total      = len(devices)
@@ -565,7 +574,7 @@ def group_page(start_dt, end_dt):
         cached_get_groups.clear()
         st.rerun()
 
-    groups = cached_get_groups(st.session_state.username, is_admin())
+    groups = cached_get_groups(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
     groups = sorted(groups, key=lambda x: x[0])
 
     rules = []
@@ -609,7 +618,7 @@ def analytics_page(start_dt, end_dt):
     mode = st.radio("View Analytics For", ["Device", "Group"], horizontal=True)
 
     if mode == "Device":
-        devices = cached_get_devices(st.session_state.username, is_admin())
+        devices = cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
         dev_ids = [d[0] for d in devices]
         if not dev_ids:
             st.warning("No devices found.")
@@ -633,7 +642,7 @@ def analytics_page(start_dt, end_dt):
         st.plotly_chart(fig, width="stretch")
 
     else:
-        groups  = cached_get_groups(st.session_state.username, is_admin())
+        groups  = cached_get_groups(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
         grp_ids = [g[0] for g in groups]
         if not grp_ids:
             st.warning("No groups found.")
@@ -682,7 +691,7 @@ def rbac_page():
 
     st.subheader("All Users")
     for u in users:
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+        c1, c2, c3, c4, c5 = st.columns([2.5, 1.5, 1.5, 1.5, 1])
         c1.write(u["username"])
         c2.write(u["role"])
 
@@ -698,7 +707,19 @@ def rbac_page():
                 st.success(f"Updated {u['username']} → {new_role}")
                 st.rerun()
 
-        if c4.button("Delete", key=f"del_{u['username']}"):
+        view_all_current = bool(u.get("view_all_devices", 0))
+        new_view_all = c4.checkbox(
+            "View All Devices",
+            value=view_all_current,
+            key=f"view_all_{u['username']}",
+        )
+        if new_view_all != view_all_current:
+            if utils.update_user_view_all(u["username"], new_view_all):
+                cached_all_users.clear()
+                st.success(f"Updated {u['username']} view permission")
+                st.rerun()
+
+        if c5.button("Delete", key=f"del_{u['username']}"):
             if u["username"] == st.session_state.username:
                 st.error("Cannot delete yourself.")
             else:
@@ -708,19 +729,23 @@ def rbac_page():
 
     st.divider()
     st.subheader("Create New User")
-    nc1, nc2, nc3, nc4 = st.columns([3, 2, 2, 1])
+    nc1, nc2, nc3, nc4 = st.columns([2.5, 1.5, 1.5, 2.5])
     new_uname = nc1.text_input("Username", key="new_uname")
     new_pass  = nc2.text_input("Password", type="password", key="new_pass")
     new_role  = nc3.selectbox("Role", utils.ROLES, key="new_role")
-    if nc4.button("Create"):
-        if not new_uname or not new_pass:
-            st.error("Username and password required.")
-        elif utils.create_user(new_uname, new_pass, new_role):
-            cached_all_users.clear()
-            st.success(f"Created user: {new_uname} ({new_role})")
-            st.rerun()
-        else:
-            st.error("Username already exists.")
+    
+    with nc4:
+        new_view_all = st.checkbox("Can view all devices", value=False, key="new_view_all",
+                                    help="Allow this user to see all devices, not just their own")
+        if st.button("Create", type="primary"):
+            if not new_uname or not new_pass:
+                st.error("Username and password required.")
+            elif utils.create_user(new_uname, new_pass, new_role, new_view_all):
+                cached_all_users.clear()
+                st.success(f"Created user: {new_uname} ({new_role})")
+                st.rerun()
+            else:
+                st.error("Username already exists.")
 
 
 # ─── SCHEDULES PAGE ───────────────────────────────────────────────────────────
@@ -830,9 +855,9 @@ def schedules_page():
         target_type = st.selectbox("Target type", ["device", "group"], key="sched_ttype")
     with c2:
         if target_type == "device":
-            target_ids = [d[0] for d in cached_get_devices(st.session_state.username, is_admin())]
+            target_ids = [d[0] for d in cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))]
         else:
-            target_ids = [g[0] for g in cached_get_groups(st.session_state.username, is_admin())]
+            target_ids = [g[0] for g in cached_get_groups(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))]
         target_id = st.selectbox(f"Select {target_type}", target_ids, key="sched_tid")
 
     c3, c4 = st.columns(2)
@@ -953,6 +978,20 @@ def dashboard():
         st.rerun()
 
     start_dt, end_dt = render_date_range_selector()
+    
+    # Attribution at bottom of sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("""
+    <div style="font-size:0.7rem; color:#505870; line-height:1.4; margin-top:20px;">
+        <strong>Made by:</strong><br>
+        Ayan Abbas (sa3421@srmist.edu.in)<br>
+        &<br>
+        Shreyan Sarkar (ss4874@srmist.edu.in)<br>
+        <br>
+        <strong>Under the guidance of</strong><br>
+        V. Jayanthi (jayanthv4@srmist.edu.in)
+    </div>
+    """, unsafe_allow_html=True)
 
     if page == "Devices":
         device_page(start_dt, end_dt)
