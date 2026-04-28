@@ -383,7 +383,10 @@ def update_device_state(username: str, deviceid: int, new_state: int) -> bool:
             (new_state, username, deviceid)
         )
         conn.commit()
-        return True
+        rows_affected = cursor.rowcount
+        log.info("update_device_state(%s, %s, %s) → %d rows updated",
+                 username, deviceid, new_state, rows_affected)
+        return rows_affected > 0
     except Exception as e:
         log.error("update_device_state error: %s", e)
         return False
@@ -406,6 +409,8 @@ def update_group_state(username: str, groupid: int, new_state: bool) -> bool:
             (int(new_state), username, groupid)
         )
         conn.commit()
+        log.info("update_group_state(%s, %s, %s) → group and devices updated",
+                 username, groupid, new_state)
         return True
     except Exception as e:
         log.error("update_group_state error: %s", e)
@@ -513,14 +518,18 @@ def get_group_power_usage(
 
 
 def get_latest_power_usage() -> dict:
-    """Returns {deviceid_str: power} from the most recent timestamp."""
+    """Returns most recent power reading per device (not global max time)."""
     t0 = time.perf_counter()
     try:
         df = _read_sql(
             """
-            SELECT deviceid, power
-            FROM power_usage_normalized
-            WHERE time = (SELECT MAX(time) FROM power_usage_normalized)
+            SELECT p.deviceid, p.power
+            FROM power_usage_normalized p
+            INNER JOIN (
+                SELECT deviceid, MAX(time) AS max_time
+                FROM power_usage_normalized
+                GROUP BY deviceid
+            ) latest ON p.deviceid = latest.deviceid AND p.time = latest.max_time
             """
         )
         result = {str(row["deviceid"]): row["power"] for _, row in df.iterrows()}
@@ -538,3 +547,121 @@ def get_power_usage():
     """Legacy wide-table fallback — fetches entire table."""
     log.warning("get_power_usage() called — fetches ENTIRE legacy table!")
     return _read_sql("SELECT * FROM power_usage ORDER BY time")
+
+
+
+# ─── SCHEDULES ────────────────────────────────────────────────────────────────
+# Add these functions to the bottom of your existing utils.py
+
+import datetime as _dt
+
+WEEKDAY_NAMES = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+
+def get_schedules(created_by: str | None = None) -> list[dict]:
+    """
+    Admin: pass created_by=None to get all schedules.
+    Regular user: pass their username.
+    """
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        if created_by is None:
+            cursor.execute(
+                """
+                SELECT id, created_by, target_type, target_id,
+                       action, mode, run_at, run_date, weekday, active, last_fired
+                FROM schedules ORDER BY active DESC, id DESC
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, created_by, target_type, target_id,
+                       action, mode, run_at, run_date, weekday, active, last_fired
+                FROM schedules
+                WHERE created_by = %s
+                ORDER BY active DESC, id DESC
+                """,
+                (created_by,)
+            )
+        return cursor.fetchall()
+    except Exception as e:
+        log.error("get_schedules error: %s", e)
+        return []
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def create_schedule(
+    created_by:  str,
+    target_type: str,           # 'device' or 'group'
+    target_id:   int,
+    action:      str,           # 'on' or 'off'
+    mode:        str,           # 'once' | 'daily' | 'weekly'
+    run_at:      _dt.time,      # IST time
+    run_date:    _dt.date | None = None,   # required for mode='once'
+    weekday:     int  | None = None,       # 0-6, required for mode='weekly'
+) -> bool:
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            """
+            INSERT INTO schedules
+                (created_by, target_type, target_id, action,
+                 mode, run_at, run_date, weekday, active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
+            """,
+            (created_by, target_type, int(target_id),
+             action, mode,
+             run_at.strftime("%H:%M:%S"),
+             run_date, weekday)
+        )
+        conn.commit()
+        log.info("create_schedule OK → id=%s", cursor.lastrowid)
+        return True
+    except Exception as e:
+        log.error("create_schedule error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def toggle_schedule(schedule_id: int, active: bool) -> bool:
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "UPDATE schedules SET active = %s WHERE id = %s",
+            (int(active), schedule_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        log.error("toggle_schedule error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def delete_schedule(schedule_id: int) -> bool:
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        log.error("delete_schedule error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
