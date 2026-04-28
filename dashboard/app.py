@@ -6,6 +6,8 @@ import time
 import logging
 import threading
 import datetime
+import base64
+import os
 
 import streamlit as st
 import plotly.graph_objects as go
@@ -97,7 +99,7 @@ def cached_all_users():
 # ─── DATE RANGE SIDEBAR WIDGET ────────────────────────────────────────────────
 def render_date_range_selector() -> tuple[datetime.datetime, datetime.datetime]:
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📅 Date Range")
+    st.sidebar.subheader("Date Range")
 
     IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
     now = datetime.datetime.now(IST).replace(tzinfo=None)
@@ -150,7 +152,7 @@ def render_date_range_selector() -> tuple[datetime.datetime, datetime.datetime]:
 # ─── CHART HELPERS ────────────────────────────────────────────────────────────
 _CHART_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(15,15,25,0.8)",
+    plot_bgcolor="rgba(0,0,0,0.6)",
     font=dict(color="#a0a8c0", family="JetBrains Mono"),
     margin=dict(l=50, r=20, t=45, b=45),
 )
@@ -206,109 +208,134 @@ def _multi_line_fig(df, x_col, device_cols, title="") -> go.Figure:
     return fig
 
 
+# ─── BACKGROUND IMAGE ─────────────────────────────────────────────────────────
+@st.cache_data
+def _get_bg_image_base64():
+    """Load and encode background image as base64"""
+    img_path = os.path.join(os.path.dirname(__file__), "bg.jpg")
+    try:
+        with open(img_path, "rb") as f:
+            data = f.read()
+        return base64.b64encode(data).decode()
+    except Exception as e:
+        log.warning(f"Could not load bg.jpg: {e}")
+        return None
+
+
 # ─── GLOBAL CSS ───────────────────────────────────────────────────────────────
 def _inject_global_css():
-    st.markdown("""
+    bg_image = _get_bg_image_base64()
+    bg_style = f"background-image: url('data:image/jpeg;base64,{bg_image}') !important;" if bg_image else ""
+    
+    st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@500;600;700;800&display=swap');
 
-    html, body, [class*="css"] {
+    html, body, [class*="css"] {{
         font-family: 'Syne', sans-serif !important;
-    }
+    }}
 
     /* Main background */
-    .stApp {
+    .stApp {{
         background: #080810 !important;
-    }
+        {bg_style}
+        background-size: cover !important;
+        background-position: center center !important;
+        background-repeat: no-repeat !important;
+        background-attachment: scroll !important;
+    }}
 
     /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: #0d0d1a !important;
-        border-right: 1px solid rgba(255,255,255,0.06) !important;
-    }
-    section[data-testid="stSidebar"] * {
+    section[data-testid="stSidebar"] {{
+        background: rgba(0, 0, 0, 0.75) !important;
+        border-right: 1px solid rgba(255,255,255,0.1) !important;
+    }}
+    section[data-testid="stSidebar"] * {{
         color: #a0a8c0 !important;
-    }
-    section[data-testid="stSidebar"] h2 {
+    }}
+    section[data-testid="stSidebar"] h2 {{
         color: #e0e8ff !important;
         font-size: 1.1rem !important;
-    }
+    }}
 
     /* Headers */
-    h1, h2, h3 {
+    h1, h2, h3 {{
         font-family: 'Syne', sans-serif !important;
         color: #e0e8ff !important;
         letter-spacing: -0.02em !important;
-    }
+    }}
 
     /* Metrics */
-    [data-testid="stMetric"] {
-        background: rgba(255,255,255,0.03) !important;
-        border: 1px solid rgba(255,255,255,0.07) !important;
+    [data-testid="stMetric"] {{
+        background: rgba(0,0,0,0.6) !important;
+        border: 1px solid rgba(255,255,255,0.15) !important;
         border-radius: 12px !important;
         padding: 16px !important;
-    }
-    [data-testid="stMetricValue"] {
+    }}
+    [data-testid="stMetricValue"] {{
         font-family: 'JetBrains Mono', monospace !important;
         color: #00e5ff !important;
-    }
+    }}
 
     /* Buttons (default) */
-    .stButton > button {
-        background: rgba(255,255,255,0.05) !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
+    .stButton > button {{
+        background: rgba(0,0,0,0.6) !important;
+        border: 1px solid rgba(255,255,255,0.2) !important;
         color: #c0c8e0 !important;
         border-radius: 8px !important;
         font-family: 'Syne', sans-serif !important;
         font-weight: 600 !important;
         transition: all 0.15s ease !important;
-    }
-    .stButton > button:hover {
-        background: rgba(255,255,255,0.1) !important;
-        border-color: rgba(255,255,255,0.2) !important;
+    }}
+    .stButton > button:hover {{
+        background: rgba(0,0,0,0.8) !important;
+        border-color: rgba(255,255,255,0.3) !important;
         color: #ffffff !important;
-    }
+    }}
 
     /* Primary button */
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #0066ff, #00ccff) !important;
-        border: none !important;
+    .stButton > button[kind="primary"] {{
+        background: rgba(14, 102, 54, 0.8) !important;
+        border: 1px solid rgba(14, 102, 54, 0.6) !important;
         color: white !important;
-    }
+    }}
+    .stButton > button[kind="primary"]:hover {{
+        background: rgba(14, 102, 54, 0.95) !important;
+    }}
 
     /* Divider */
-    hr {
+    hr {{
         border-color: rgba(255,255,255,0.06) !important;
-    }
+    }}
 
     /* Radio */
-    .stRadio label {
+    .stRadio label {{
         color: #a0a8c0 !important;
-    }
+    }}
 
     /* Selectbox */
-    .stSelectbox > div > div {
-        background: rgba(255,255,255,0.04) !important;
-        border-color: rgba(255,255,255,0.1) !important;
+    .stSelectbox > div > div {{
+        background: rgba(0,0,0,0.6) !important;
+        border-color: rgba(255,255,255,0.2) !important;
         color: #e0e8ff !important;
-    }
+    }}
 
     /* Info/warning boxes */
-    .stAlert {
-        background: rgba(255,255,255,0.04) !important;
+    .stAlert {{
+        background: rgba(0,0,0,0.6) !important;
         border-radius: 10px !important;
-    }
+    }}
 
     /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden !important;}
-    footer {visibility: hidden !important;}
-    header {visibility: hidden !important;}
-    .stDeployButton {display: none !important;}
-    [data-testid="stToolbar"] {display: none !important;}
+    #MainMenu {{visibility: hidden !important;}}
+    footer {{visibility: hidden !important;}}
+    header {{visibility: hidden !important;}}
+    .stDeployButton {{display: none !important;}}
+    [data-testid="stToolbar"] {{display: none !important;}}
     
     /* Hide form submit helper text */
-    .stForm [data-testid="stFormSubmitButton"] + div {display: none !important;}
-    .stForm small {display: none !important;}
+    .stForm [data-testid="stFormSubmitButton"] + div {{display: none !important;}}
+    .stForm small {{display: none !important;}}
     </style>
     """, unsafe_allow_html=True)
 
@@ -360,15 +387,15 @@ def _build_device_css(page_devices, latest_pwr):
     rules = []
     for deviceid, groupid, state, owner in page_devices:
         if bool(state):
-            bg     = "linear-gradient(160deg, #00873a, #00c853)"
-            fg     = "#d0ffe8"
-            border = "rgba(0,200,83,0.4)"
-            shadow = "rgba(0,200,83,0.35)"
+            bg     = "rgba(14, 102, 54, 0.85)"
+            fg     = "#e8f5e9"
+            border = "rgba(14, 102, 54, 0.6)"
+            shadow = "rgba(14, 102, 54, 0.5)"
         else:
-            bg     = "linear-gradient(160deg, #7f0000, #c62828)"
-            fg     = "#ffd0d0"
-            border = "rgba(198,40,40,0.4)"
-            shadow = "rgba(198,40,40,0.35)"
+            bg     = "rgba(147, 25, 30, 0.85)"
+            fg     = "#ffebee"
+            border = "rgba(147, 25, 30, 0.6)"
+            shadow = "rgba(147, 25, 30, 0.5)"
         rules.append(_BTN_RULE.format(
             id=deviceid, bg=bg, fg=fg, border=border, shadow=shadow
         ))
@@ -378,6 +405,16 @@ def _build_device_css(page_devices, latest_pwr):
 # ─── LOGIN PAGE ───────────────────────────────────────────────────────────────
 def login_page():
     _inject_global_css()
+    
+    # Override background position for login page (center vertical image)
+    st.markdown("""
+    <style>
+    .stApp {{
+        background-position: center center !important;
+        background-size: auto 100vh !important;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
 
     # Centered login card
     st.markdown("""
@@ -394,7 +431,7 @@ def login_page():
 
     pool_ready = utils._connector_pool is not None
     if not pool_ready:
-        st.info("Connecting to database… (first load ~15–20 s)", icon="🔌")
+        st.info("Connecting to database… (first load ~15–20 s)")
         st_autorefresh(interval=2000, key="pool_check")
 
     col = st.columns([1, 1.2, 1])[1]
@@ -424,12 +461,12 @@ def device_page(start_dt: datetime.datetime, end_dt: datetime.datetime):
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        if st.button("↺ Refresh States"):
+        if st.button("Refresh States"):
             cached_get_devices.clear()
             cached_get_latest_power.clear()
             st.rerun()
     with col2:
-        if st.button("↺ Refresh Power"):
+        if st.button("Refresh Power"):
             cached_get_latest_power.clear()
             st.rerun()
     with col3:
@@ -529,7 +566,7 @@ def device_modal(devices, start_dt, end_dt):
 
         c1, c2 = st.columns([1, 5])
         with c1:
-            if st.button("🗑 Delete Device"):
+            if st.button("Delete Device"):
                 utils.delete_device(owner, deviceid)
                 cached_get_devices.clear()
                 st.session_state.selected_device = None
@@ -537,7 +574,7 @@ def device_modal(devices, start_dt, end_dt):
     else:
         st.info(f"State: {'ON' if state else 'OFF'}  (viewer — no controls)")
 
-    if st.button("✕ Close"):
+    if st.button("Close"):
         st.session_state.selected_device = None
         st.rerun()
 
@@ -570,7 +607,7 @@ _GRP_RULE = """.st-key-group_{id} button {{
 
 def group_page(start_dt, end_dt):
     st.header("Groups")
-    if st.button("↺ Refresh Groups"):
+    if st.button("Refresh Groups"):
         cached_get_groups.clear()
         st.rerun()
 
@@ -580,11 +617,11 @@ def group_page(start_dt, end_dt):
     rules = []
     for groupid, state, owner in groups:
         if bool(state):
-            bg, fg = "linear-gradient(160deg,#00873a,#00c853)", "#d0ffe8"
-            border, shadow = "rgba(0,200,83,0.4)", "rgba(0,200,83,0.3)"
+            bg, fg = "rgba(14, 102, 54, 0.85)", "#e8f5e9"
+            border, shadow = "rgba(14, 102, 54, 0.6)", "rgba(14, 102, 54, 0.5)"
         else:
-            bg, fg = "linear-gradient(160deg,#7f0000,#c62828)", "#ffd0d0"
-            border, shadow = "rgba(198,40,40,0.4)", "rgba(198,40,40,0.3)"
+            bg, fg = "rgba(147, 25, 30, 0.85)", "#ffebee"
+            border, shadow = "rgba(147, 25, 30, 0.6)", "rgba(147, 25, 30, 0.5)"
         rules.append(_GRP_RULE.format(
             id=groupid, bg=bg, fg=fg, border=border, shadow=shadow
         ))
@@ -777,7 +814,7 @@ def _fmt_run_at(run_at) -> str:
 
 
 def schedules_page():
-    st.header("⏰ Schedules")
+    st.header("Schedules")
     st.caption("Automatic ON/OFF actions for devices or groups (IST).")
 
     IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -824,7 +861,7 @@ def schedules_page():
                 when = f"Every {day_name} at {run_at_str} IST"
 
             label = (
-                f"{'🟢' if active else '⚫'}  "
+                f"{'Active' if active else 'Paused'}  "
                 f"**{s['target_type'].capitalize()} {s['target_id']}** → "
                 f"turn **{s['action'].upper()}**  |  {when}"
             )
@@ -925,7 +962,7 @@ def schedules_page():
         else:
             st.write("")
 
-    if st.button("➕ Create Schedule", type="primary"):
+    if st.button("Create Schedule", type="primary"):
         if target_id is None:
             st.error("No target selected.")
         else:
