@@ -1,0 +1,9 @@
+POST https://82ekr32yn2.execute-api.us-east-1.amazonaws.com/device/data
+Content-Type: application/json
+
+{
+  "username": "sa3421@srmist.edu.in",
+  "password": "password",
+  "device_id": 1,
+  "wattage": 1500
+}

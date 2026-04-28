@@ -1,12 +1,26 @@
 import re
+import time
+import logging
 import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
 import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
+
+# ─── LOGGING SETUP ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(funcName)s – %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("eiot")
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 pw = "AyansDataBase"
 
 _DB_CONFIG = {
-    "host": "eiot.cu5iw2g8er81.us-east-1.rds.amazonaws.com",
+    "host": "eiot.c7eqmkyyitqo.ap-south-1.rds.amazonaws.com",
     "port": 3306,
     "database": "eiot",
     "user": "admin",
@@ -15,613 +29,426 @@ _DB_CONFIG = {
     "ssl_ca": "C:/certs/global-bundle.pem",
 }
 
-_pool = None
-
-
-def _get_pool():
-    global _pool
-    if _pool is None:
-        _pool = MySQLConnectionPool(
-            pool_name="eiot_pool",
-            pool_size=10,
-            pool_reset_session=True,
-            **_DB_CONFIG,
-        )
-    return _pool
-
-
+_POWER_HISTORY_LIMIT = 500
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+# ─── CONNECTION POOLS ─────────────────────────────────────────────────────────
+# Two pools with different purposes:
+#   _connector_pool  → DML (INSERT/UPDATE/DELETE) via mysql-connector cursors
+#   _sqlalchemy_engine → SELECT via pd.read_sql (eliminates DBAPI2 warning + faster)
+
+_connector_pool = None
+_sqlalchemy_engine = None
 
 
 def _validate_column_name(name: str) -> str:
-    """Validate that a column name is safe for inclusion in SQL."""
     name = str(name)
     if not _SAFE_ID_RE.match(name):
         raise ValueError(f"Invalid column name: {name!r}")
     return name
 
 
+def _get_connector_pool():
+    global _connector_pool
+    if _connector_pool is None:
+        t0 = time.perf_counter()
+        _connector_pool = MySQLConnectionPool(
+            pool_name="eiot_pool",
+            pool_size=10,
+            pool_reset_session=True,
+            connect_timeout=5,
+            **_DB_CONFIG,
+        )
+        log.info("mysql-connector pool created [%.0f ms]", (time.perf_counter() - t0) * 1000)
+    return _connector_pool
+
+
+def _get_engine():
+    """SQLAlchemy engine used exclusively for pd.read_sql SELECT queries."""
+    global _sqlalchemy_engine
+    if _sqlalchemy_engine is None:
+        t0 = time.perf_counter()
+        url = (
+            f"mysql+mysqlconnector://{_DB_CONFIG['user']}:{_DB_CONFIG['password']}"
+            f"@{_DB_CONFIG['host']}:{_DB_CONFIG['port']}/{_DB_CONFIG['database']}"
+        )
+        _sqlalchemy_engine = create_engine(
+            url,
+            connect_args={"ssl_ca": _DB_CONFIG["ssl_ca"]},
+            poolclass=QueuePool,
+            pool_size=5,
+            max_overflow=5,
+            pool_pre_ping=True,   # avoids stale-connection penalty
+            pool_recycle=300,
+        )
+        log.info("SQLAlchemy engine created [%.0f ms]", (time.perf_counter() - t0) * 1000)
+    return _sqlalchemy_engine
+
+
 def get_connection():
-    return _get_pool().get_connection()
-
-
-def authenticate_user(username, password) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-        cursor.execute(
-            "SELECT password FROM users WHERE username = %s",
-            (username,)
-        )
-
-        result = cursor.fetchone()
-
-        if result is None:
-            print("Username not found.")
-            return False
-
-        if result[0] == password:
-            print("Login successful!")
-            return True
-        else:
-            print("Incorrect password.")
-            return False
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def create_user(username, password) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            INSERT INTO users (username, password)
-            VALUES (%s, %s)
-            """,
-            (username, password)
-        )
-
-        conn.commit()
-
-        print("User created successfully!")
-        return True
-
-    except mysql.connector.Error as e:
-        if e.errno == 1062:
-            print("User already exists.")
-            return False
-        else:
-            print(f"Database error: {e}")
-            return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def get_devices(username):
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            SELECT deviceid, groupid, state FROM devices
-            where username = %s;
-            """,
-            (username,)
-        )
-
-        devices = cursor.fetchall()
-        return devices
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def create_device(username, deviceid, groupid = None) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            INSERT INTO devices (deviceid, username, groupid, state)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (deviceid, username, groupid, False)
-        )
-
-        conn.commit()
-
-        print("Device created successfully!")
-        return True
-
-    except mysql.connector.Error as e:
-        if e.errno == 1062:
-            print("Device already exists.")
-            return False
-        else:
-            print(f"Database error: {e}")
-            return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def delete_device(username, deviceid) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            DELETE FROM devices
-            WHERE username = %s AND deviceid = %s;
-            """,
-            (username, deviceid)
-        )
-
-        conn.commit()
-
-        print("Device deleted successfully!")
-        return True
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def get_groups(username):
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            SELECT groupid, state FROM device_groups
-            where username = %s;
-            """,
-            (username,)
-        )
-
-        groups = cursor.fetchall()
-        return groups
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def create_group(username, groupid) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            INSERT INTO device_groups (groupid, username, state)
-            VALUES (%s, %s, %s)
-            """,
-            (groupid, username, False)
-        )
-
-        conn.commit()
-
-        print("Group created successfully!")
-        return True
-
-    except mysql.connector.Error as e:
-        if e.errno == 1062:
-            print("Group already exists.")
-            return False
-        else:
-            print(f"Database error: {e}")
-            return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def delete_group(username, groupid) -> bool:
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        # 1️⃣ Unassign devices from group
-        cursor.execute(
-            """
-            UPDATE devices
-            SET groupid = NULL
-            WHERE username = %s AND groupid = %s;
-            """,
-            (username, groupid)
-        )
-
-        print("Devices unassigned from group successfully!")
-
-        # Delete the group
-        cursor.execute(
-            """
-            DELETE FROM device_groups
-            WHERE username = %s AND groupid = %s;
-            """,
-            (username, groupid)
-        )
-
-        print("Group deleted successfully!")
-
-        # Commit once
-        conn.commit()
-
-        return True
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        if conn:
-            conn.rollback()
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def get_group_devices(username, groupid):
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            SELECT deviceid, state FROM devices
-            where username = %s and groupid = %s;
-            """,
-            (username, groupid)
-        )
-
-        devices = cursor.fetchall()
-        return devices
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return []
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def update_device_state(username, deviceid, new_state):
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            UPDATE devices
-            SET state = %s
-            WHERE username = %s AND deviceid = %s;
-            """,
-            (new_state, username, deviceid)
-        )
-
-        conn.commit()
-
-        print("Device state updated successfully!")
-        return True
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def update_group_state(username, groupid, new_state):
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(buffered=True)
-
-        cursor.execute(
-            """
-            UPDATE device_groups
-            SET state = %s
-            WHERE username = %s AND groupid = %s;
-            """,
-            (new_state, username, groupid)
-        )
-
-        conn.commit()
-
-        print("Group state updated successfully!")
-
-        cursor.execute(
-            """
-            UPDATE devices
-            SET state = %s
-            WHERE username = %s AND groupid = %s;
-            """,
-            (new_state, username, groupid)
-        )
-
-        conn.commit()
-
-        print("All devices in group updated successfully!")
-        return True
-
-    except Exception as e:
-        print(f"Database error: {e}")
-        return False
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def get_power_usage():
-    conn = get_connection()
-
-    query = """
-        SELECT * FROM power_usage
-        ORDER BY time
+    """Raw mysql-connector connection from pool (for DML only)."""
+    t0 = time.perf_counter()
+    conn = _get_connector_pool().get_connection()
+    elapsed = (time.perf_counter() - t0) * 1000
+    if elapsed > 50:
+        log.warning("get_connection SLOW %.0f ms", elapsed)
+    else:
+        log.debug("get_connection %.0f ms", elapsed)
+    return conn
+
+
+def _read_sql(query: str) -> pd.DataFrame:
     """
-
-    df = pd.read_sql(query, conn)
-
-    conn.close()
-
+    Wrapper for pd.read_sql using SQLAlchemy engine.
+    Eliminates the pandas DBAPI2 UserWarning and ~200ms overhead from raw connectors.
+    """
+    t0 = time.perf_counter()
+    with _get_engine().connect() as conn:
+        df = pd.read_sql(text(query), conn)
+    log.debug("_read_sql [%.0f ms] → %d rows", (time.perf_counter() - t0) * 1000, len(df))
     return df
 
 
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
+
+def authenticate_user(username, password) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
+        result = cursor.fetchone()
+        ok = result is not None and result[0] == password
+        log.info("authenticate_user(%s) → %s  [%.0f ms]", username, ok, (time.perf_counter() - t0) * 1000)
+        return ok
+    except Exception as e:
+        log.error("authenticate_user error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def create_user(username, password) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (username, password))
+        conn.commit()
+        log.info("create_user(%s) OK [%.0f ms]", username, (time.perf_counter() - t0) * 1000)
+        return True
+    except mysql.connector.Error as e:
+        if e.errno == 1062:
+            log.warning("create_user(%s) already exists", username)
+            return False
+        log.error("create_user error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ─── DEVICES ──────────────────────────────────────────────────────────────────
+
+def get_devices(username):
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT deviceid, groupid, state FROM devices WHERE username = %s", (username,))
+        devices = cursor.fetchall()
+        log.info("get_devices(%s) → %d rows [%.0f ms]", username, len(devices), (time.perf_counter() - t0) * 1000)
+        return devices
+    except Exception as e:
+        log.error("get_devices error: %s", e)
+        return []
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def create_device(username, deviceid, groupid=None) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "INSERT INTO devices (deviceid, username, groupid, state) VALUES (%s, %s, %s, %s)",
+            (deviceid, username, groupid, False)
+        )
+        conn.commit()
+        log.info("create_device(%s, %s) OK [%.0f ms]", username, deviceid, (time.perf_counter() - t0) * 1000)
+        return True
+    except mysql.connector.Error as e:
+        if e.errno == 1062:
+            log.warning("create_device(%s) already exists", deviceid)
+            return False
+        log.error("create_device error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def delete_device(username, deviceid) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("DELETE FROM devices WHERE username = %s AND deviceid = %s", (username, deviceid))
+        conn.commit()
+        log.info("delete_device(%s, %s) OK [%.0f ms]", username, deviceid, (time.perf_counter() - t0) * 1000)
+        return True
+    except Exception as e:
+        log.error("delete_device error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ─── GROUPS ───────────────────────────────────────────────────────────────────
+
+def get_groups(username):
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT groupid, state FROM device_groups WHERE username = %s", (username,))
+        groups = cursor.fetchall()
+        log.info("get_groups(%s) → %d rows [%.0f ms]", username, len(groups), (time.perf_counter() - t0) * 1000)
+        return groups
+    except Exception as e:
+        log.error("get_groups error: %s", e)
+        return []
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def create_group(username, groupid) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "INSERT INTO device_groups (groupid, username, state) VALUES (%s, %s, %s)",
+            (groupid, username, False)
+        )
+        conn.commit()
+        log.info("create_group(%s, %s) OK [%.0f ms]", username, groupid, (time.perf_counter() - t0) * 1000)
+        return True
+    except mysql.connector.Error as e:
+        if e.errno == 1062:
+            log.warning("create_group(%s) already exists", groupid)
+            return False
+        log.error("create_group error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def delete_group(username, groupid) -> bool:
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("UPDATE devices SET groupid = NULL WHERE username = %s AND groupid = %s", (username, groupid))
+        cursor.execute("DELETE FROM device_groups WHERE username = %s AND groupid = %s", (username, groupid))
+        conn.commit()
+        log.info("delete_group(%s, %s) OK [%.0f ms]", username, groupid, (time.perf_counter() - t0) * 1000)
+        return True
+    except Exception as e:
+        log.error("delete_group error: %s", e)
+        if conn: conn.rollback()
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def get_group_devices(username, groupid):
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute("SELECT deviceid, state FROM devices WHERE username = %s AND groupid = %s", (username, groupid))
+        devices = cursor.fetchall()
+        log.info("get_group_devices(%s, %s) → %d rows [%.0f ms]", username, groupid, len(devices), (time.perf_counter() - t0) * 1000)
+        return devices
+    except Exception as e:
+        log.error("get_group_devices error: %s", e)
+        return []
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ─── STATE UPDATES ────────────────────────────────────────────────────────────
+
+def update_device_state(username, deviceid, new_state):
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "UPDATE devices SET state = %s WHERE username = %s AND deviceid = %s",
+            (new_state, username, deviceid)
+        )
+        conn.commit()
+        log.info("update_device_state(%s, %s, %s) OK [%.0f ms]", username, deviceid, new_state, (time.perf_counter() - t0) * 1000)
+        return True
+    except Exception as e:
+        log.error("update_device_state error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+def update_group_state(username, groupid, new_state):
+    t0 = time.perf_counter()
+    conn = cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "UPDATE device_groups SET state = %s WHERE username = %s AND groupid = %s",
+            (new_state, username, groupid)
+        )
+        cursor.execute(
+            "UPDATE devices SET state = %s WHERE username = %s AND groupid = %s",
+            (new_state, username, groupid)
+        )
+        conn.commit()
+        log.info("update_group_state(%s, %s, %s) OK [%.0f ms]", username, groupid, new_state, (time.perf_counter() - t0) * 1000)
+        return True
+    except Exception as e:
+        log.error("update_group_state error: %s", e)
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ─── POWER USAGE ──────────────────────────────────────────────────────────────
+
 def get_device_power_usage(deviceid):
-    """
-    Returns time series power usage for a single device.
-    """
-
-    conn = None
-
+    """Time-series for a single device — last _POWER_HISTORY_LIMIT rows."""
+    t0 = time.perf_counter()
     try:
         safe_col = _validate_column_name(deviceid)
-        conn = get_connection()
-
-        query = f"""
+        df = _read_sql(f"""
             SELECT time, `{safe_col}`
-            FROM power_usage
-            ORDER BY time
-        """
-
-        df = pd.read_sql(query, conn)
-
-        # rename device column to 'power'
+            FROM (
+                SELECT time, `{safe_col}`
+                FROM power_usage
+                ORDER BY time DESC
+                LIMIT {_POWER_HISTORY_LIMIT}
+            ) sub
+            ORDER BY time ASC
+        """)
         df = df.rename(columns={str(deviceid): "power"})
-
+        log.info("get_device_power_usage(%s) → %d rows [%.0f ms]", deviceid, len(df), (time.perf_counter() - t0) * 1000)
         return df
-
     except Exception as e:
-        print(f"Database error: {e}")
+        log.error("get_device_power_usage error: %s", e)
         return pd.DataFrame()
-
-    finally:
-        if conn:
-            conn.close()
 
 
 def get_group_power_usage(username, groupid):
-    conn = None
-    cursor = None
-
+    """Time-series for all devices in a group — last _POWER_HISTORY_LIMIT rows."""
+    t0 = time.perf_counter()
+    conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-
-        # Get device IDs in the group
-        cursor.execute("""
-            SELECT deviceid
-            FROM devices
-            WHERE username = %s AND groupid = %s
-        """, (username, groupid))
-
+        cursor.execute(
+            "SELECT deviceid FROM devices WHERE username = %s AND groupid = %s",
+            (username, groupid)
+        )
         devices = [str(row["deviceid"]) for row in cursor.fetchall()]
+        log.debug("get_group_power_usage: %d devices in group %s", len(devices), groupid)
 
         if not devices:
             return pd.DataFrame()
 
-        # Build column selection (validated to prevent injection)
         device_columns = ", ".join([f"`{_validate_column_name(d)}`" for d in devices])
 
-        query = f"""
+        df = _read_sql(f"""
             SELECT time, {device_columns}
-            FROM power_usage
-            ORDER BY time
-        """
-
-        # Load into DataFrame
-        df = pd.read_sql(query, conn)
-
+            FROM (
+                SELECT time, {device_columns}
+                FROM power_usage
+                ORDER BY time DESC
+                LIMIT {_POWER_HISTORY_LIMIT}
+            ) sub
+            ORDER BY time ASC
+        """)
+        log.info("get_group_power_usage(%s, %s) → %d rows × %d cols [%.0f ms]",
+                 username, groupid, len(df), len(df.columns), (time.perf_counter() - t0) * 1000)
         return df
-
     except Exception as e:
-        print(f"Database error: {e}")
+        log.error("get_group_power_usage error: %s", e)
         return pd.DataFrame()
-
     finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-
-def get_myPowerUsage():
-    conn = get_connection()
-
-    query = """
-        SELECT * FROM myPowerUsage
-        WHERE time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
-        ORDER BY TIME;
-    """
-
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
+        if cursor: cursor.close()
+        if conn:   conn.close()
 
 
 def get_latest_power_usage():
-    """
-    Returns the latest power usage row from the power_usage table.
-    Each device is stored as a column.
-    """
-
-    conn = None
-    cursor = None
-
+    """Returns dict {deviceid_str: power_value} from the most recent row."""
+    t0 = time.perf_counter()
+    conn = cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-
-        cursor.execute("""
-            SELECT *
-            FROM power_usage
-            ORDER BY time DESC
-            LIMIT 1;
-        """)
-
+        cursor.execute("SELECT * FROM power_usage ORDER BY time DESC LIMIT 1")
         row = cursor.fetchone()
-
-        return row if row else {}
-
+        if not row:
+            return {}
+        row.pop("time", None)
+        log.info("get_latest_power_usage() → %d device values [%.0f ms]",
+                 len(row), (time.perf_counter() - t0) * 1000)
+        return row
     except Exception as e:
-        print(f"Database error: {e}")
+        log.error("get_latest_power_usage error: %s", e)
         return {}
-
     finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+        if cursor: cursor.close()
+        if conn:   conn.close()
+
+
+# ─── LEGACY ───────────────────────────────────────────────────────────────────
+
+def get_power_usage():
+    log.warning("get_power_usage() called — fetches ENTIRE table!")
+    return _read_sql("SELECT * FROM power_usage ORDER BY time")
+
+
+def get_myPowerUsage():
+    t0 = time.perf_counter()
+    df = _read_sql("""
+        SELECT * FROM myPowerUsage
+        WHERE time >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+        ORDER BY time
+    """)
+    log.info("get_myPowerUsage() → %d rows [%.0f ms]", len(df), (time.perf_counter() - t0) * 1000)
+    return df
 
 
 if __name__ == "__main__":
-    
-    # print("\n--- CREATE USER TEST ---")
-    # print(create_user("localtest", "1234"))
-
-    # print("\n--- LOGIN SUCCESS TEST ---")
-    # print(authenticate_user("sa3421@srmist.edu.in", "password"))
-
-    # print("\n--- LOGIN WRONG PASSWORD ---")
-    # print(authenticate_user("localtest", "wrongpass"))
-
-    # print("\n--- LOGIN USER NOT FOUND ---")
-    # print(authenticate_user("nouser", "1234"))
-
     print("\n--- GET DEVICES ---")
     print(get_devices("sa3421@srmist.edu.in"))
-
-    # print("\n--- CREATE DEVICE ---")
-    # print(create_device("sa3421@srmist.edu.in", 501, 1))
-
-    # print("\n--- DELETE DEVICE ---")
-    # print(delete_device("sa3421@srmist.edu.in", 501))
-
-    # print("\n--- GET GROUPS ---")
-    # print(get_groups("sa3421@srmist.edu.in"))
-
-    # print("\n--- CREATE GROUP ---")
-    # print(create_group("sa3421@srmist.edu.in", 11))
-
-    # print("\n--- DELETE GROUP ---")
-    # print(delete_group("sa3421@srmist.edu.in", 11))
-
-    # print("\n--- GET GROUP DEVICES ---")
-    # print(get_group_devices("sa3421@srmist.edu.in", 1))
-
-    # print("\n--- UPDATE DEVICE STATE ---")
-    # print(update_device_state("sa3421@srmist.edu.in", 1, True))
-
-    # print("\n--- UPDATE GROUP STATE ---")
-    # print(update_group_state("sa3421@srmist.edu.in", 1, True))
-
-    # print("\n--- GET GROUP DEVICES AFTER UPDATE ---")
-    # print(get_group_devices("sa3421@srmist.edu.in", 1))
-
-    # print("\n--- GET POWER USAGE ---")
-    # print(get_power_usage())
-
-    # print("\n--- GET GROUP POWER USAGE ---")
-    # print(get_group_power_usage("sa3421@srmist.edu.in", 1))
-
-    # print("\n--- GET MY POWER USAGE ---")
-    # print(get_myPowerUsage())
-
-    # print("\n--- GET LATEST POWER USAGE ---")
-    # print(get_latest_power_usage())

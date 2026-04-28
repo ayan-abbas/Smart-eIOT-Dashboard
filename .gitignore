@@ -219,6 +219,3 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-
-test.http
-lambda_package

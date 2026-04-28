@@ -17,15 +17,19 @@ try:
     cursor = conn.cursor()
     
     cursor.execute("use eiot")
-
-    username = input("Enter username: ")
-    cursor.execute(f"SELECT username FROM users WHERE username = {username}")
-
-    if cursor.fetchone():
-        password = input("Enter password: ")
-        cursor.execute(f"SELECT password FROM users WHERE username = {username}")
-
-        if cursor.fetchone()[0] == password:
+    cursor.execute("SELECT username FROM users")  
+    print(cursor.fetchall())  
+    # username = input("Enter username: ")
+    username = "sa3421@srmist.edu.in"
+    cursor.execute("SELECT username FROM users WHERE username = %s", (username,))
+    result = cursor.fetchone()
+    print(result)
+    if result:
+        # password = input("Enter password: ")
+        password = "password"
+        cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
+        user_password = cursor.fetchone()
+        if user_password and user_password[0] == password:
             print("Login successful!")  
         else:
             print("Incorrect password.")

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 pw = "AyansDataBase"
 
 conn = mysql.connector.connect(
-    host='eiot.cu5iw2g8er81.us-east-1.rds.amazonaws.com',
+    host='eiot.c7eqmkyyitqo.ap-south-1.rds.amazonaws.com',
     port=3306,
     database='eiot',
     user='admin',
