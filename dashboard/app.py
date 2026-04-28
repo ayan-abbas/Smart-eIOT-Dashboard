@@ -1,33 +1,41 @@
+"""
+app.py  –  eiot Dashboard v2
+────────────────────────────────────────────────────────────────
+Changes from v1:
+  • Roles: admin / operator / viewer (gate toggles + RBAC page)
+  • Admin sees ALL devices/groups across all users
+  • Date-range selector in sidebar (min: 1 h, default: 30 days)
+    → all charts honour the selected range via SQL
+  • power_usage_normalized replaces wide table for charts
+  • Gap-safe Plotly traces (connectgaps=False)
+  • Multi-user safe: session state is per browser tab
+"""
+
 import time
 import logging
 import threading
+import datetime
 
 import streamlit as st
-import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
 import utils
 
-# --- LOGGING SETUP ---
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(funcName)s - %(message)s",
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(funcName)s – %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("eiot.app")
 
-st.set_page_config(layout="wide")
-
+st.set_page_config(page_title="eIoT Dashboard", layout="wide")
 _t_script_start = time.perf_counter()
-log.debug("-- script rerun started --")
+log.debug("── script rerun started ──")
 
 
-# --- POOL WARM-UP (non-blocking) ---
-# RDS cold-connect from India ~20s SSL handshake latency.
-# Background thread means login page renders immediately on startup.
-
+# ─── POOL WARM-UP ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def _start_pool_warmup():
     def _warmup():
@@ -35,126 +43,207 @@ def _start_pool_warmup():
         try:
             conn = utils.get_connection()
             conn.close()
-            log.info("Background pool warm-up done [%.0f ms]", (time.perf_counter() - t0) * 1000)
+            log.info("Pool warm-up done [%.0f ms]", (time.perf_counter() - t0) * 1000)
         except Exception as e:
-            log.error("Background pool warm-up failed: %s", e)
-    t = threading.Thread(target=_warmup, daemon=True, name="pool-warmup")
-    t.start()
-    log.info("Pool warm-up started in background thread")
+            log.error("Pool warm-up failed: %s", e)
+    threading.Thread(target=_warmup, daemon=True, name="pool-warmup").start()
     return True
 
 _start_pool_warmup()
 
 
-# --- CACHED DATA HELPERS ---
+# ─── SESSION STATE DEFAULTS ───────────────────────────────────────────────────
+_DEFAULTS = {
+    "logged_in":        False,
+    "username":         None,
+    "role":             None,      # "admin" | "operator" | "viewer"
+    "selected_device":  None,
+    "auto_refresh":     False,
+    "device_page_offset": 0,
+}
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ─── ROLE HELPERS ─────────────────────────────────────────────────────────────
+def is_admin()    -> bool: return st.session_state.role == "admin"
+def is_operator() -> bool: return st.session_state.role in ("admin", "operator")
+def is_viewer()   -> bool: return True   # everyone can view
+
+
+# ─── CACHED DATA ──────────────────────────────────────────────────────────────
+@st.cache_data(ttl=30)
+def cached_get_devices(username, admin):
+    return utils.get_devices(username, is_admin=admin)
 
 @st.cache_data(ttl=30)
-def cached_get_devices(username):
-    log.debug("CACHE MISS: cached_get_devices(%s)", username)
-    t0 = time.perf_counter()
-    result = utils.get_devices(username)
-    log.info("cached_get_devices(%s) populated [%.0f ms]", username, (time.perf_counter() - t0) * 1000)
-    return result
-
-
-@st.cache_data(ttl=30)
-def cached_get_latest_power_usage():
-    log.debug("CACHE MISS: cached_get_latest_power_usage")
-    t0 = time.perf_counter()
-    result = utils.get_latest_power_usage()
-    log.info("cached_get_latest_power_usage populated [%.0f ms]", (time.perf_counter() - t0) * 1000)
-    return result
-
+def cached_get_latest_power():
+    return utils.get_latest_power_usage()
 
 @st.cache_data(ttl=60)
-def cached_get_device_power_usage(deviceid):
-    log.debug("CACHE MISS: cached_get_device_power_usage(%s)", deviceid)
-    t0 = time.perf_counter()
-    result = utils.get_device_power_usage(deviceid)
-    log.info("cached_get_device_power_usage(%s) populated [%.0f ms]", deviceid, (time.perf_counter() - t0) * 1000)
-    return result
-
+def cached_device_power(deviceid, start_iso, end_iso):
+    start = datetime.datetime.fromisoformat(start_iso)
+    end   = datetime.datetime.fromisoformat(end_iso)
+    return utils.get_device_power_usage(deviceid, start, end)
 
 @st.cache_data(ttl=30)
-def cached_get_groups(username):
-    log.debug("CACHE MISS: cached_get_groups(%s)", username)
-    t0 = time.perf_counter()
-    result = utils.get_groups(username)
-    log.info("cached_get_groups(%s) populated [%.0f ms]", username, (time.perf_counter() - t0) * 1000)
-    return result
-
+def cached_get_groups(username, admin):
+    return utils.get_groups(username, is_admin=admin)
 
 @st.cache_data(ttl=60)
-def cached_get_group_power_usage(username, groupid):
-    log.debug("CACHE MISS: cached_get_group_power_usage(%s, %s)", username, groupid)
-    t0 = time.perf_counter()
-    result = utils.get_group_power_usage(username, groupid)
-    log.info("cached_get_group_power_usage(%s, %s) populated [%.0f ms]", username, groupid, (time.perf_counter() - t0) * 1000)
-    return result
+def cached_group_power(username, groupid, start_iso, end_iso, admin):
+    start = datetime.datetime.fromisoformat(start_iso)
+    end   = datetime.datetime.fromisoformat(end_iso)
+    return utils.get_group_power_usage(username, groupid, start, end, is_admin=admin)
+
+@st.cache_data(ttl=120)
+def cached_all_users():
+    return utils.get_all_users()
 
 
-# --- SESSION STATE ---
+# ─── DATE RANGE SIDEBAR WIDGET ────────────────────────────────────────────────
+def render_date_range_selector() -> tuple[datetime.datetime, datetime.datetime]:
+    """
+    Renders a date-range control in the sidebar.
+    Returns (start_dt, end_dt) as UTC-naive datetimes.
+    """
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📅 Date Range")
 
-for key, default in [
-    ("logged_in", False),
-    ("username", None),
-    ("selected_device", None),
-    ("auto_refresh", False),
-    ("device_page_offset", 0),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now = datetime.datetime.now(IST).replace(tzinfo=None)
+
+    preset = st.sidebar.selectbox(
+        "Quick range",
+        ["Last hour", "Last 6 hours", "Last 24 hours",
+         "Last 7 days", "Last 30 days", "Custom"],
+        index=4,    # default: Last 30 days
+        key="date_preset",
+    )
+
+    presets = {
+        "Last hour":    now - datetime.timedelta(hours=1),
+        "Last 6 hours": now - datetime.timedelta(hours=6),
+        "Last 24 hours":now - datetime.timedelta(hours=24),
+        "Last 7 days":  now - datetime.timedelta(days=7),
+        "Last 30 days": now - datetime.timedelta(days=30),
+    }
+
+    if preset != "Custom":
+        start_dt = presets[preset]
+        end_dt   = now
+    else:
+        # Date picker: clamp min to 30 days back, max to today
+        thirty_ago = (now - datetime.timedelta(days=30)).date()
+        today      = now.date()
+
+        start_date = st.sidebar.date_input(
+            "From", value=thirty_ago,
+            min_value=thirty_ago, max_value=today,
+            key="custom_start",
+        )
+        end_date = st.sidebar.date_input(
+            "To", value=today,
+            min_value=thirty_ago, max_value=today,
+            key="custom_end",
+        )
+        # Enforce min 1 h range
+        start_dt = datetime.datetime.combine(start_date, datetime.time.min)
+        end_dt   = datetime.datetime.combine(end_date, datetime.time.max)
+        if (end_dt - start_dt).total_seconds() < 3600:
+            st.sidebar.warning("Range must be at least 1 hour — adjusting.")
+            end_dt = start_dt + datetime.timedelta(hours=1)
+
+    st.sidebar.caption(
+        f"From: {start_dt.strftime('%Y-%m-%d %H:%M')} IST\n"
+        f"To:   {end_dt.strftime('%Y-%m-%d %H:%M')} IST"
+    )
+    return start_dt, end_dt
 
 
-# --- LOGIN PAGE ---
+# ─── CHART HELPER ─────────────────────────────────────────────────────────────
+def _line_fig(df, x_col, y_col, title="", y_label="Power (W)") -> go.Figure:
+    """
+    Single-series line chart with gap-safe rendering.
+    NaN/missing rows show as breaks, not interpolated.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df[x_col], y=df[y_col],
+        mode="lines",
+        connectgaps=False,         # gaps stay as gaps
+        line=dict(width=1.5),
+        name=y_label,
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title=y_label,
+        margin=dict(l=40, r=20, t=40, b=40),
+        yaxis=dict(range=[0, 900]),   
+        height=350,
+    )
+    return fig
 
+
+def _multi_line_fig(df, x_col, device_cols, title="") -> go.Figure:
+    """
+    Multi-device line chart. Each device is one trace.
+    Devices with all-NaN in range are silently skipped.
+    """
+    fig = go.Figure()
+    for col in device_cols:
+        series = df[col]
+        if series.isna().all():
+            continue
+        fig.add_trace(go.Scatter(
+            x=df[x_col], y=series,
+            mode="lines",
+            connectgaps=False,
+            line=dict(width=1),
+            name=f"Dev {col}",
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Power (W)",
+        yaxis=dict(range=[0, 900]),   
+        legend=dict(orientation="h", y=-0.25, font_size=10),
+        margin=dict(l=40, r=20, t=40, b=80),
+        height=450,
+    )
+    return fig
+
+
+# ─── LOGIN PAGE ───────────────────────────────────────────────────────────────
 def login_page():
-    t0 = time.perf_counter()
     st.title("Enterprise IoT Dashboard")
 
-    # Show status while background pool thread is still connecting
     pool_ready = utils._connector_pool is not None
     if not pool_ready:
-        st.info(
-            "Connecting to database... (first load only, usually 15-20s due to RDS cold start)",
-            icon="🔌"
-        )
-        # Auto-rerun every 2s to re-check pool readiness
+        st.info("Connecting to database… (first load, usually 15-20 s)", icon="🔌")
         st_autorefresh(interval=2000, key="pool_check")
 
-    col1, col2 = st.columns(2)
+    st.subheader("Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    btn_label = "Login" if pool_ready else "Waiting for DB…"
 
-    with col1:
-        st.subheader("Login")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        btn_label = "Login" if pool_ready else "Waiting for DB..."
-        if st.button(btn_label, disabled=not pool_ready):
-            if utils.authenticate_user(username, password):
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.rerun()
-            else:
-                st.error("Invalid credentials")
+    if st.button(btn_label, disabled=not pool_ready):
+        result = utils.authenticate_user(username, password)
+        if result:
+            st.session_state.logged_in = True
+            st.session_state.username  = result["username"]
+            st.session_state.role      = result["role"]
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
 
-    with col2:
-        st.subheader("Create Account")
-        new_user = st.text_input("New Username")
-        new_pass = st.text_input("New Password", type="password")
-        if st.button("Create User", disabled=not pool_ready):
-            if utils.create_user(new_user, new_pass):
-                st.success("User created")
-            else:
-                st.error("User exists")
-
-    log.debug("login_page rendered [%.0f ms] pool_ready=%s", (time.perf_counter() - t0) * 1000, pool_ready)
+    st.caption("Account creation is managed by an administrator.")
 
 
-# --- DEVICE GRID ---
-# Virtualized: only render PAGE_SIZE devices at a time instead of all 500.
-# 500 Streamlit buttons = ~500ms widget serialization per rerun.
-# 100 buttons = ~100ms.
-
+# ─── DEVICE GRID ──────────────────────────────────────────────────────────────
 PAGE_SIZE = 100
 
 _GRID_CSS = """<style>
@@ -170,148 +259,120 @@ _BTN_CSS = """.st-key-device_{id} button {{
 .st-key-device_{id} button:hover {{transform:scale(1.05);box-shadow:0 0 10px rgba(255,255,255,0.35);}}"""
 
 
-def device_page():
-    t0 = time.perf_counter()
+def device_page(start_dt: datetime.datetime, end_dt: datetime.datetime):
     st.header("Devices")
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        if st.button("Refresh Device States"):
-            log.info("Manual refresh: device states")
-            cached_get_devices.clear()
-            cached_get_latest_power_usage.clear()
-            st.rerun()
+        if st.button("Refresh States"):
+            cached_get_devices.clear(); cached_get_latest_power.clear(); st.rerun()
     with col2:
-        if st.button("Refresh Power Usage"):
-            log.info("Manual refresh: power usage")
-            cached_get_latest_power_usage.clear()
-            st.rerun()
+        if st.button("Refresh Power"):
+            cached_get_latest_power.clear(); st.rerun()
     with col3:
         st.session_state.auto_refresh = st.toggle(
-            "Auto Refresh (5 sec)", value=st.session_state.auto_refresh
+            "Auto Refresh (5 s)", value=st.session_state.auto_refresh
         )
 
     if st.session_state.auto_refresh:
         st_autorefresh(interval=5000, key="refresh")
 
-    t_fetch = time.perf_counter()
-    devices = cached_get_devices(st.session_state.username)
-    latest_power = cached_get_latest_power_usage()
-    log.info("Data fetch (devices + latest_power) [%.0f ms]", (time.perf_counter() - t_fetch) * 1000)
+    devices     = cached_get_devices(st.session_state.username, is_admin())
+    latest_pwr  = cached_get_latest_power()
+    devices     = sorted(devices, key=lambda x: x[0])
+    total       = len(devices)
 
-    devices = sorted(devices, key=lambda x: x[0])
-    total = len(devices)
+    # Device detail panel
+    device_modal(devices, start_dt, end_dt)
 
-    # Show device detail panel above grid
-    device_modal(devices)
-
-    # Pagination controls
+    # Pagination
     offset = st.session_state.device_page_offset
-    offset = max(0, min(offset, total - 1))
+    offset = max(0, min(offset, max(0, total - 1)))
     page_devices = devices[offset: offset + PAGE_SIZE]
 
-    pcol1, pcol2, pcol3 = st.columns([1, 3, 1])
-    with pcol1:
+    pc1, pc2, pc3 = st.columns([1, 3, 1])
+    with pc1:
         if st.button("< Prev", disabled=(offset == 0)):
-            st.session_state.device_page_offset = max(0, offset - PAGE_SIZE)
-            st.rerun()
-    with pcol2:
-        end = min(offset + PAGE_SIZE, total)
-        st.caption(f"Showing devices {offset + 1}-{end} of {total}")
-    with pcol3:
+            st.session_state.device_page_offset = max(0, offset - PAGE_SIZE); st.rerun()
+    with pc2:
+        st.caption(f"Showing {offset+1}–{min(offset+PAGE_SIZE,total)} of {total}")
+    with pc3:
         if st.button("Next >", disabled=(offset + PAGE_SIZE >= total)):
-            st.session_state.device_page_offset = offset + PAGE_SIZE
-            st.rerun()
+            st.session_state.device_page_offset = offset + PAGE_SIZE; st.rerun()
 
-    # Single CSS block for this page only
-    t_css = time.perf_counter()
+    # CSS
     css_parts = []
-    for deviceid, groupid, state in page_devices:
+    for row in page_devices:
+        deviceid, groupid, state, owner = row
         color = "#2ecc71" if bool(state) else "#e74c3c"
         css_parts.append(_BTN_CSS.format(id=deviceid, color=color))
     st.markdown(_GRID_CSS.format(styles="\n".join(css_parts)), unsafe_allow_html=True)
-    log.debug("CSS injection [%.0f ms] for %d devices", (time.perf_counter() - t_css) * 1000, len(page_devices))
 
     # Grid
-    t_grid = time.perf_counter()
     grid_cols = 10
-    rows = [page_devices[i:i + grid_cols] for i in range(0, len(page_devices), grid_cols)]
-
+    rows = [page_devices[i:i+grid_cols] for i in range(0, len(page_devices), grid_cols)]
     for row in rows:
         cols = st.columns(grid_cols)
-        for i, (deviceid, groupid, state) in enumerate(row):
+        for i, (deviceid, groupid, state, owner) in enumerate(row):
             state = bool(state)
-            power = latest_power.get(str(deviceid), None)
-            power_text = f"{power} W" if power else "-"
-            tooltip = f"Device {deviceid} | Group {groupid} | {'ON' if state else 'OFF'} | {power_text}"
-
-            if cols[i].button(f"{deviceid}\n{power_text}", key=f"device_{deviceid}", help=tooltip):
-                log.info("Device %s clicked", deviceid)
+            power = latest_pwr.get(str(deviceid), None)
+            ptext = f"{power} W" if power else "–"
+            tip   = f"Device {deviceid} | Group {groupid} | {'ON' if state else 'OFF'} | {ptext}"
+            if cols[i].button(f"{deviceid}\n{ptext}", key=f"device_{deviceid}", help=tip):
                 st.session_state.selected_device = deviceid
                 st.rerun()
 
-    log.info("device_page grid rendered [%.0f ms] (%d on page)", (time.perf_counter() - t_grid) * 1000, len(page_devices))
-    log.info("device_page total [%.0f ms]", (time.perf_counter() - t0) * 1000)
 
-
-# --- DEVICE MODAL ---
-
-def device_modal(devices):
-    t0 = time.perf_counter()
+def device_modal(devices, start_dt, end_dt):
     deviceid = st.session_state.get("selected_device")
     if deviceid is None:
-        log.debug("device_modal: no device selected, skipping")
         return
 
-    current_device = next((d for d in devices if d[0] == deviceid), None)
-    if current_device is None:
-        log.warning("device_modal: selected device %s not found", deviceid)
+    current = next((d for d in devices if d[0] == deviceid), None)
+    if current is None:
         return
 
-    deviceid, groupid, state = current_device
+    deviceid, groupid, state, owner = current
     state = bool(state)
 
     st.divider()
-    st.subheader(f"Device {deviceid}")
+    st.subheader(f"Device {deviceid}  |  Group {groupid}  |  Owner: {owner}")
 
-    t_chart = time.perf_counter()
-    df = cached_get_device_power_usage(deviceid)
-    log.info("device_modal: chart data fetch [%.0f ms] (%d rows)", (time.perf_counter() - t_chart) * 1000, len(df))
+    start_iso = start_dt.isoformat()
+    end_iso   = end_dt.isoformat()
+    df = cached_device_power(deviceid, start_iso, end_iso)
 
     if not df.empty:
-        t_plot = time.perf_counter()
-        fig = px.line(df, x="time", y="power")
-        st.plotly_chart(fig, width="stretch")
-        log.debug("device_modal: plotly render [%.0f ms]", (time.perf_counter() - t_plot) * 1000)
+        fig = _line_fig(df, "time", "power", title=f"Device {deviceid} – Power Usage")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No power data for selected range.")
 
-    st.write(f"Group: {groupid}")
+    # Operator/admin: can toggle; viewer: read-only
+    if is_operator():
+        new_state = st.toggle("Device ON", value=state, key=f"device_toggle_{deviceid}")
+        if new_state != state:
+            utils.update_device_state(owner, deviceid, int(new_state))
+            cached_get_devices.clear()
+            st.success("Device state updated")
+            st.rerun()
 
-    new_state = st.toggle("Device ON", value=state, key=f"device_toggle_{deviceid}")
-    if new_state != state:
-        log.info("device_modal: toggling device %s -> %s", deviceid, new_state)
-        utils.update_device_state(st.session_state.username, deviceid, int(new_state))
-        cached_get_devices.clear()
-        st.success("Device state updated")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Delete Device"):
+                utils.delete_device(owner, deviceid)
+                cached_get_devices.clear()
+                st.session_state.selected_device = None
+                st.rerun()
+    else:
+        st.info(f"State: {'ON' if state else 'OFF'}  (viewer — no controls)")
+
+    if st.button("Close"):
+        st.session_state.selected_device = None
         st.rerun()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Delete Device"):
-            log.info("device_modal: deleting device %s", deviceid)
-            utils.delete_device(st.session_state.username, deviceid)
-            cached_get_devices.clear()
-            st.session_state.selected_device = None
-            st.rerun()
-    with col2:
-        if st.button("Close"):
-            st.session_state.selected_device = None
-            st.rerun()
 
-    log.info("device_modal total [%.0f ms]", (time.perf_counter() - t0) * 1000)
-
-
-# --- GROUP PAGE ---
-
+# ─── GROUP PAGE ───────────────────────────────────────────────────────────────
 _GROUP_CSS = """<style>
 div[data-testid="stVerticalBlock"] {{ gap: 0.35rem; }}
 {styles}
@@ -324,141 +385,206 @@ _GRP_BTN_CSS = """.st-key-group_{id} button {{
 .st-key-group_{id} button:hover {{transform:scale(1.05);box-shadow:0 0 10px rgba(255,255,255,0.35);}}"""
 
 
-def group_page():
-    t0 = time.perf_counter()
+def group_page(start_dt, end_dt):
     st.header("Groups")
+    if st.button("Refresh Groups"):
+        cached_get_groups.clear(); st.rerun()
 
-    if st.button("Refresh Group States"):
-        log.info("Manual refresh: groups")
-        cached_get_groups.clear()
-        st.rerun()
-
-    t_fetch = time.perf_counter()
-    groups = cached_get_groups(st.session_state.username)
-    log.info("group_page: data fetch [%.0f ms] (%d groups)", (time.perf_counter() - t_fetch) * 1000, len(groups))
+    groups = cached_get_groups(st.session_state.username, is_admin())
     groups = sorted(groups, key=lambda x: x[0])
 
-    t_css = time.perf_counter()
-    css_parts = [_GRP_BTN_CSS.format(id=g[0], color="#2ecc71" if bool(g[1]) else "#e74c3c") for g in groups]
+    css_parts = [_GRP_BTN_CSS.format(id=g[0], color="#2ecc71" if bool(g[1]) else "#e74c3c")
+                 for g in groups]
     st.markdown(_GROUP_CSS.format(styles="\n".join(css_parts)), unsafe_allow_html=True)
-    log.debug("group_page: CSS injection [%.0f ms]", (time.perf_counter() - t_css) * 1000)
 
     grid_cols = 5
-    rows = [groups[i:i + grid_cols] for i in range(0, len(groups), grid_cols)]
+    rows = [groups[i:i+grid_cols] for i in range(0, len(groups), grid_cols)]
     for row in rows:
         cols = st.columns(grid_cols)
-        for i, (groupid, state) in enumerate(row):
+        for i, (groupid, state, owner) in enumerate(row):
             state = bool(state)
-            if cols[i].button(
-                f"Group {groupid}",
-                key=f"group_{groupid}",
-                help=f"Group {groupid} | {'ON' if state else 'OFF'} | Click to toggle"
-            ):
-                log.info("group_page: toggling group %s -> %s", groupid, not state)
-                utils.update_group_state(st.session_state.username, groupid, not state)
-                cached_get_groups.clear()
-                cached_get_devices.clear()
-                st.rerun()
-
-    log.info("group_page total [%.0f ms]", (time.perf_counter() - t0) * 1000)
+            label = f"Group {groupid}\n{'ON' if state else 'OFF'}"
+            if is_operator():
+                if cols[i].button(label, key=f"group_{groupid}",
+                                  help=f"Click to toggle group {groupid}"):
+                    utils.update_group_state(owner, groupid, not state)
+                    cached_get_groups.clear()
+                    cached_get_devices.clear()
+                    st.rerun()
+            else:
+                cols[i].button(label, key=f"group_{groupid}", disabled=True)
 
 
-# --- ANALYTICS PAGE ---
-
-def analytics_page():
-    t0 = time.perf_counter()
+# ─── ANALYTICS PAGE ───────────────────────────────────────────────────────────
+def analytics_page(start_dt, end_dt):
     st.header("Analytics")
 
-    mode = st.radio("View Analytics For", ["Device", "Group"])
+    start_iso = start_dt.isoformat()
+    end_iso   = end_dt.isoformat()
+
+    mode = st.radio("View Analytics For", ["Device", "Group"], horizontal=True)
 
     if mode == "Device":
-        devices = cached_get_devices(st.session_state.username)
-        selected = st.selectbox("Select Device", [d[0] for d in devices])
+        devices  = cached_get_devices(st.session_state.username, is_admin())
+        dev_ids  = [d[0] for d in devices]
+        if not dev_ids:
+            st.warning("No devices found."); return
 
-        t_fetch = time.perf_counter()
-        df = cached_get_device_power_usage(selected)
-        log.info("analytics_page: device data fetch [%.0f ms] (%d rows)", (time.perf_counter() - t_fetch) * 1000, len(df))
-
-        t_plot = time.perf_counter()
-        fig = px.line(df, x="time", y="power")
-        st.plotly_chart(fig, width="stretch")
-        log.debug("analytics_page: device plotly render [%.0f ms]", (time.perf_counter() - t_plot) * 1000)
-
-    else:
-        groups = cached_get_groups(st.session_state.username)
-        selected = st.selectbox("Select Group", [g[0] for g in groups])
-
-        t_fetch = time.perf_counter()
-        df = cached_get_group_power_usage(st.session_state.username, selected)
-        log.info("analytics_page: group data fetch [%.0f ms] (%d rows x %d cols)",
-                 (time.perf_counter() - t_fetch) * 1000, len(df), len(df.columns) if not df.empty else 0)
+        selected = st.selectbox("Select Device", dev_ids)
+        df = cached_device_power(selected, start_iso, end_iso)
 
         if df.empty:
-            st.warning("No data")
+            st.info("No data for this device in the selected range.")
+            return
+
+        # Summary stats
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Avg Power",  f"{df['power'].mean():.0f} W")
+        c2.metric("Peak Power", f"{df['power'].max():.0f} W")
+        c3.metric("Readings",   f"{len(df):,}")
+
+        fig = _line_fig(df, "time", "power",
+                        title=f"Device {selected} – Power Usage",
+                        y_label="Power (W)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        groups = cached_get_groups(st.session_state.username, is_admin())
+        grp_ids = [g[0] for g in groups]
+        if not grp_ids:
+            st.warning("No groups found."); return
+
+        selected = st.selectbox("Select Group", grp_ids)
+        df = cached_group_power(
+            st.session_state.username, selected, start_iso, end_iso, is_admin()
+        )
+
+        if df.empty:
+            st.info("No data for this group in the selected range.")
             return
 
         device_cols = [c for c in df.columns if c != "time"]
 
-        # One combined chart vs 50 individual charts (was 2.5s bottleneck)
-        t_plot = time.perf_counter()
-        view = st.radio("Chart view", ["Combined (fast)", "Individual grids"], horizontal=True)
+        # Thin out columns for combined view if >20 devices
+        MAX_TRACES = 20
+        view = st.radio(
+            "Chart view",
+            ["Combined", "Individual grids"],
+            horizontal=True,
+        )
 
         if view == "Combined (fast)":
-            fig = go.Figure()
-            for col in device_cols:
-                fig.add_trace(go.Scatter(x=df["time"], y=df[col], mode="lines", name=f"Device {col}"))
-            fig.update_layout(
-                title=f"Group {selected} - All Devices",
-                xaxis_title="Time",
-                yaxis_title="Power (W)",
-                legend=dict(orientation="h", y=-0.2),
-                height=500,
-            )
-            st.plotly_chart(fig, width="stretch")
-            log.debug("analytics_page: combined chart render [%.0f ms]", (time.perf_counter() - t_plot) * 1000)
+            cols_to_plot = device_cols[:MAX_TRACES]
+            if len(device_cols) > MAX_TRACES:
+                st.caption(f"Showing first {MAX_TRACES} of {len(device_cols)} devices for clarity.")
+            fig = _multi_line_fig(df, "time", cols_to_plot,
+                                  title=f"Group {selected} – All Devices")
+            st.plotly_chart(fig, use_container_width=True)
         else:
             grid_cols = 2
-            rows = [device_cols[i:i + grid_cols] for i in range(0, len(device_cols), grid_cols)]
+            rows = [device_cols[i:i+grid_cols] for i in range(0, len(device_cols), grid_cols)]
             for row in rows:
                 cols = st.columns(grid_cols)
-                for i, device in enumerate(row):
-                    fig = px.line(df, x="time", y=device, title=f"Device {device}")
-                    fig.update_layout(xaxis_title="Time", yaxis_title="Power (W)")
-                    cols[i].plotly_chart(fig, width="stretch")
-            log.debug("analytics_page: individual charts render [%.0f ms]", (time.perf_counter() - t_plot) * 1000)
+                for idx, dev in enumerate(row):
+                    sub = df[["time", dev]].dropna(subset=[dev])
+                    if sub.empty:
+                        cols[idx].warning(f"Device {dev}: no data")
+                        continue
+                    fig = _line_fig(sub, "time", dev, title=f"Device {dev}")
+                    cols[idx].plotly_chart(fig, use_container_width=True)
 
-    log.info("analytics_page total [%.0f ms]", (time.perf_counter() - t0) * 1000)
+
+# ─── RBAC PAGE (admin only) ───────────────────────────────────────────────────
+def rbac_page():
+    st.header("User Management (Admin)")
+
+    users = cached_all_users()
+
+    # ── Current users table ──────────────────────────────────
+    st.subheader("All Users")
+    for u in users:
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+        c1.write(u["username"])
+        c2.write(u["role"])
+
+        new_role = c3.selectbox(
+            "Role", options=list(utils.ROLES),
+            index=list(utils.ROLES).index(u["role"]),
+            key=f"role_sel_{u['username']}",
+            label_visibility="collapsed",
+        )
+        if new_role != u["role"]:
+            if utils.update_user_role(u["username"], new_role):
+                cached_all_users.clear()
+                st.success(f"Updated {u['username']} → {new_role}")
+                st.rerun()
+
+        if c4.button("Delete", key=f"del_{u['username']}"):
+            if u["username"] == st.session_state.username:
+                st.error("Cannot delete yourself.")
+            else:
+                utils.delete_user(u["username"])
+                cached_all_users.clear()
+                st.rerun()
+
+    st.divider()
+
+    # ── Create new user ──────────────────────────────────────
+    st.subheader("Create New User")
+    with st.container():
+        nc1, nc2, nc3, nc4 = st.columns([3, 2, 2, 1])
+        new_uname = nc1.text_input("Username", key="new_uname")
+        new_pass  = nc2.text_input("Password", type="password", key="new_pass")
+        new_role  = nc3.selectbox("Role", utils.ROLES, key="new_role")
+        if nc4.button("Create"):
+            if not new_uname or not new_pass:
+                st.error("Username and password required.")
+            elif utils.create_user(new_uname, new_pass, new_role):
+                cached_all_users.clear()
+                st.success(f"Created user: {new_uname} ({new_role})")
+                st.rerun()
+            else:
+                st.error("Username already exists.")
 
 
-# --- MAIN DASHBOARD ---
-
+# ─── MAIN DASHBOARD ───────────────────────────────────────────────────────────
 def dashboard():
-    t0 = time.perf_counter()
-    st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Menu", ["Devices", "Groups", "Analytics"])
-    st.sidebar.write(f"Logged in as {st.session_state.username}")
+    st.sidebar.title("eIoT Dashboard")
+    st.sidebar.caption(
+        f"**{st.session_state.username}**  |  role: `{st.session_state.role}`"
+    )
+
+    pages = ["Devices", "Groups", "Analytics"]
+    if is_admin():
+        pages.append("User Management")
+
+    page = st.sidebar.radio("Navigation", pages)
 
     if st.sidebar.button("Logout"):
-        st.session_state.logged_in = False
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
         st.rerun()
 
-    log.debug("Rendering page: %s", page)
+    start_dt, end_dt = render_date_range_selector()
 
     if page == "Devices":
-        device_page()
+        device_page(start_dt, end_dt)
     elif page == "Groups":
-        group_page()
+        group_page(start_dt, end_dt)
     elif page == "Analytics":
-        analytics_page()
+        analytics_page(start_dt, end_dt)
+    elif page == "User Management":
+        if is_admin():
+            rbac_page()
+        else:
+            st.error("Access denied.")
 
-    log.info("dashboard() total [%.0f ms]", (time.perf_counter() - t0) * 1000)
 
-
-# --- ENTRY POINT ---
-
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 if not st.session_state.logged_in:
     login_page()
 else:
     dashboard()
 
-log.info("-- script rerun complete [%.0f ms] --", (time.perf_counter() - _t_script_start) * 1000)
+log.info("── script rerun complete [%.0f ms] ──",
+         (time.perf_counter() - _t_script_start) * 1000)
