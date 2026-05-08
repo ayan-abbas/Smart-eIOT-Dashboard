@@ -10,6 +10,75 @@ def lambda_handler(event, context):
     print(f"METHOD: {method}, PATH: {path}")  # add this
 
 
+    # GET /device/states
+    # Returns all device states for the authenticated user in one response.
+    if method == "GET" and path == "/device/states":
+
+        query_params = event.get("queryStringParameters") or {}
+
+        username = query_params.get("username")
+        password = query_params.get("password")
+
+        if not username or not password:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing username/password"})
+            }
+
+        conn = None
+
+        try:
+            conn = mysql.connector.connect(
+                host="eiot.c7eqmkyyitqo.ap-south-1.rds.amazonaws.com",
+                port=3306,
+                user="admin",
+                password="AyansDataBase",
+                database="eiot",
+                ssl_disabled=False
+            )
+
+            cursor = conn.cursor(buffered=True)
+
+            cursor.execute(
+                "SELECT password FROM users WHERE username = %s",
+                (username,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] != password:
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({"error": "Unauthorized"})
+                }
+
+            cursor.execute(
+                "SELECT deviceid, state FROM devices WHERE username = %s ORDER BY deviceid",
+                (username,)
+            )
+            rows = cursor.fetchall() or []
+
+            device_ids = [int(r[0]) for r in rows]
+            states = [int(r[1]) for r in rows]
+
+            cursor.close()
+
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "username": username,
+                    "device_ids": device_ids,
+                    "states": states
+                })
+            }
+
+        except Exception as e:
+            print(f"Database error: {e}")
+            raise
+
+        finally:
+            if conn:
+                conn.close()
+
+
 # POST /device/data
     if method == "POST" and path == "/device/data":
 

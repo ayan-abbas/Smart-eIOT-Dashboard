@@ -1,9 +1,0 @@
-POST https://itya5y2blk.execute-api.ap-south-1.amazonaws.com/default/device/data
-Content-Type: application/json
-
-{
-  "username": "sa3421@srmist.edu.in",
-  "password": "password",
-  "device_id": 1,
-  "wattage": 500
-}

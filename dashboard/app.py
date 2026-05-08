@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("eiot.app")
 
-st.set_page_config(page_title="eIoT Dashboard", layout="wide")
+st.set_page_config(page_title="eIoT Dashboard", layout="wide", initial_sidebar_state="expanded")
 _t_script_start = time.perf_counter()
 log.debug("── script rerun started ──")
 
@@ -257,6 +257,44 @@ def _inject_global_css():
         color: #e0e8ff !important;
         font-size: 1.1rem !important;
     }}
+    /* Compact sidebar spacing to avoid vertical scrolling */
+    section[data-testid="stSidebar"] .block-container {{
+        padding-top: 0.35rem !important;
+        padding-bottom: 0.55rem !important;
+    }}
+    section[data-testid="stSidebar"] hr {{
+        margin: 0.25rem 0 !important;
+    }}
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 {{
+        margin-top: 0.25rem !important;
+        margin-bottom: 0.15rem !important;
+    }}
+    section[data-testid="stSidebar"] .stMarkdown {{
+        margin-top: 0.15rem !important;
+        margin-bottom: 0.15rem !important;
+    }}
+    section[data-testid="stSidebar"] p {{
+        margin: 0.25rem 0 !important;
+        line-height: 1.25 !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+        margin-top: 0.15rem !important;
+        margin-bottom: 0.15rem !important;
+    }}
+    section[data-testid="stSidebar"] .stButton > button {{
+        padding: 0.35rem 0.6rem !important;
+    }}
+    section[data-testid="stSidebar"] [data-testid="stSelectbox"],
+    section[data-testid="stSidebar"] [data-testid="stRadio"] {{
+        margin-bottom: 0.25rem !important;
+    }}
+    /* Reduce spacing between Streamlit sidebar blocks */
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div {{
+        padding-top: 0.05rem !important;
+        padding-bottom: 0.05rem !important;
+    }}
 
     /* Headers */
     h1, h2, h3 {{
@@ -329,9 +367,77 @@ def _inject_global_css():
     /* Hide Streamlit branding */
     #MainMenu {{visibility: hidden !important;}}
     footer {{visibility: hidden !important;}}
-    header {{visibility: hidden !important;}}
+    /* Hide Deploy button (Streamlit Cloud) */
     .stDeployButton {{display: none !important;}}
-    [data-testid="stToolbar"] {{display: none !important;}}
+    [data-testid="stDeployButton"] {{display: none !important;}}
+    /* Streamlit "decoration" container (often where Deploy/top-right chrome lives) */
+    #stDecoration {{display: none !important;}}
+    [data-testid="stDecoration"] {{display: none !important;}}
+    /* Newer Streamlit versions render Deploy as a header base button */
+    button[kind="header"][data-testid^="stBaseButton-header"] {{
+        display: none !important;
+    }}
+    /* Some Streamlit versions render Deploy as a toolbar action button */
+    [data-testid="stToolbarActionButton"] {{display: none !important;}}
+    [data-testid="stToolbarActions"] {{gap: 0 !important;}}
+    [data-testid="stToolbarActions"] button {{
+        /* Hide any remaining toolbar action buttons (Deploy lives here) */
+        display: none !important;
+    }}
+    /* Extra safety: common labels/titles */
+    button[title="Deploy"],
+    button[aria-label="Deploy"] {{
+        display: none !important;
+    }}
+
+    /* Remove the ugly top bar without hiding the entire header (hiding the header can also hide
+       the sidebar expand control). Make the header transparent and hide the toolbar content. */
+    header[data-testid="stHeader"] {{
+        background: transparent !important;
+        box-shadow: none !important;
+        border-bottom: none !important;
+    }}
+    [data-testid="stToolbar"] {{
+        background: transparent !important;
+    }}
+
+    /* When the sidebar is collapsed, Streamlit shows an expand control.
+       Force it visible and positioned, across multiple Streamlit versions. */
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"],
+    [aria-label="Open sidebar"],
+    button[title="Open sidebar"] {{
+        visibility: visible !important;
+        display: block !important;
+        opacity: 1 !important;
+        position: fixed !important;
+        top: 10px !important;
+        left: 10px !important;
+        z-index: 1000000 !important;
+        pointer-events: auto !important;
+    }}
+
+    /* Reduce extra top padding Streamlit sometimes adds */
+    div[data-testid="stAppViewContainer"] > .main {{
+        padding-top: 1rem !important;
+    }}
+
+    /* Schedules list cards */
+    .schedule-card {{
+        background: rgba(0,0,0,0.6) !important;
+        border: 1px solid rgba(255,255,255,0.14) !important;
+        border-radius: 12px !important;
+        padding: 10px 14px !important;
+        margin: 6px 0 !important;
+        line-height: 1.35 !important;
+    }}
+    .schedule-card code {{
+        background: rgba(255,255,255,0.06) !important;
+        border: 1px solid rgba(255,255,255,0.10) !important;
+        padding: 1px 6px !important;
+        border-radius: 8px !important;
+        color: #e0e8ff !important;
+    }}
     
     /* Hide form submit helper text */
     .stForm [data-testid="stFormSubmitButton"] + div {{display: none !important;}}
@@ -477,8 +583,18 @@ def device_page(start_dt: datetime.datetime, end_dt: datetime.datetime):
     if st.session_state.auto_refresh:
         st_autorefresh(interval=5000, key="refresh")
 
-    devices    = cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
-    latest_pwr = cached_get_latest_power()
+    # IMPORTANT: cached_get_devices/cached_get_latest_power use ttl=30s.
+    # If auto-refresh is ON, bypass caches so the UI updates on the expected 5s cadence.
+    if st.session_state.auto_refresh:
+        devices = utils.get_devices(
+            st.session_state.username,
+            is_admin=is_admin(),
+            view_all=st.session_state.get("view_all_devices", False),
+        )
+        latest_pwr = utils.get_latest_power_usage()
+    else:
+        devices    = cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
+        latest_pwr = cached_get_latest_power()
     devices    = sorted(devices, key=lambda x: x[0])
     total      = len(devices)
 
@@ -652,7 +768,14 @@ def analytics_page(start_dt, end_dt):
     start_iso = start_dt.isoformat()
     end_iso   = end_dt.isoformat()
 
-    mode = st.radio("View Analytics For", ["Device", "Group"], horizontal=True)
+    # Defaults: Group → Group 1 → Combined (applies on first open; Streamlit remembers choices after)
+    mode = st.radio(
+        "View Analytics For",
+        ["Device", "Group"],
+        horizontal=True,
+        index=1,
+        key="analytics_mode",
+    )
 
     if mode == "Device":
         devices = cached_get_devices(st.session_state.username, is_admin(), st.session_state.get("view_all_devices", False))
@@ -661,7 +784,7 @@ def analytics_page(start_dt, end_dt):
             st.warning("No devices found.")
             return
 
-        selected = st.selectbox("Select Device", dev_ids)
+        selected = st.selectbox("Select Device", dev_ids, key="analytics_device")
         df = cached_device_power(selected, start_iso, end_iso)
 
         if df.empty:
@@ -685,39 +808,56 @@ def analytics_page(start_dt, end_dt):
             st.warning("No groups found.")
             return
 
-        selected = st.selectbox("Select Group", grp_ids)
-        df = cached_group_power(
-            st.session_state.username, selected, start_iso, end_iso, is_admin()
+        default_group_index = grp_ids.index(1) if 1 in grp_ids else 0
+        selected = st.selectbox(
+            "Select Group",
+            grp_ids,
+            index=default_group_index,
+            key="analytics_group",
         )
 
-        if df.empty:
-            st.info("No data for this group in the selected range.")
-            return
+        view = st.radio(
+            "Chart view",
+            ["Combined", "Individual grids"],
+            horizontal=True,
+            index=0,
+            key="analytics_group_view",
+        )
 
-        device_cols = [c for c in df.columns if c != "time"]
-        MAX_TRACES  = 20
+        # Group analytics involves a pivot and can be slow; show an explicit loading indicator.
+        with st.spinner("Displaying table..."):
+            df = cached_group_power(
+                st.session_state.username, selected, start_iso, end_iso, is_admin()
+            )
 
-        view = st.radio("Chart view", ["Combined", "Individual grids"], horizontal=True)
+            if df.empty:
+                st.info("No data for this group in the selected range.")
+                return
 
-        if view == "Combined":
-            cols_to_plot = device_cols[:MAX_TRACES]
-            if len(device_cols) > MAX_TRACES:
-                st.caption(f"Showing first {MAX_TRACES} of {len(device_cols)} devices.")
-            fig = _multi_line_fig(df, "time", cols_to_plot,
-                                  title=f"Group {selected} – All Devices")
-            st.plotly_chart(fig, width="stretch")
-        else:
-            GRID_COLS = 2
-            rows = [device_cols[i:i+GRID_COLS] for i in range(0, len(device_cols), GRID_COLS)]
-            for row in rows:
-                cols = st.columns(GRID_COLS)
-                for idx, dev in enumerate(row):
-                    sub = df[["time", dev]].dropna(subset=[dev])
-                    if sub.empty:
-                        cols[idx].warning(f"Device {dev}: no data")
-                        continue
-                    fig = _line_fig(sub, "time", dev, title=f"Device {dev}")
-                    cols[idx].plotly_chart(fig, width="stretch")
+            device_cols = [c for c in df.columns if c != "time"]
+            MAX_TRACES  = 20
+
+            if view == "Combined":
+                cols_to_plot = device_cols[:MAX_TRACES]
+                if len(device_cols) > MAX_TRACES:
+                    st.caption(f"Showing first {MAX_TRACES} of {len(device_cols)} devices.")
+                fig = _multi_line_fig(
+                    df, "time", cols_to_plot,
+                    title=f"Group {selected} – All Devices",
+                )
+                st.plotly_chart(fig, width="stretch")
+            else:
+                GRID_COLS = 2
+                rows = [device_cols[i:i+GRID_COLS] for i in range(0, len(device_cols), GRID_COLS)]
+                for row in rows:
+                    cols = st.columns(GRID_COLS)
+                    for idx, dev in enumerate(row):
+                        sub = df[["time", dev]].dropna(subset=[dev])
+                        if sub.empty:
+                            cols[idx].warning(f"Device {dev}: no data")
+                            continue
+                        fig = _line_fig(sub, "time", dev, title=f"Device {dev}")
+                        cols[idx].plotly_chart(fig, width="stretch")
 
 
 # ─── RBAC PAGE ────────────────────────────────────────────────────────────────
@@ -860,16 +1000,19 @@ def schedules_page():
                 day_name = WEEKDAY_NAMES[s["weekday"]] if s["weekday"] is not None else "?"
                 when = f"Every {day_name} at {run_at_str} IST"
 
-            label = (
-                f"{'Active' if active else 'Paused'}  "
-                f"**{s['target_type'].capitalize()} {s['target_id']}** → "
-                f"turn **{s['action'].upper()}**  |  {when}"
+            target = f"{s['target_type'].capitalize()} {s['target_id']}"
+            action = str(s["action"]).upper()
+            created_by = s.get("created_by")
+            label_html = (
+                f"<strong>{'Active' if active else 'Paused'}</strong> &nbsp; "
+                f"<strong>{target}</strong> &rarr; turn <strong>{action}</strong> "
+                f"&nbsp;|&nbsp; {when}"
             )
-            if is_admin():
-                label += f"  |  by `{s['created_by']}`"
+            if is_admin() and created_by:
+                label_html += f" &nbsp;|&nbsp; by <code>{created_by}</code>"
 
             c1, c2, c3 = st.columns([6, 1, 1])
-            c1.markdown(label)
+            c1.markdown(f"<div class='schedule-card'>{label_html}</div>", unsafe_allow_html=True)
             if c2.button("Pause" if active else "Resume", key=f"tog_{s['id']}"):
                 utils.toggle_schedule(s["id"], not active)
                 cached_get_schedules.clear()
@@ -1019,14 +1162,11 @@ def dashboard():
     # Attribution at bottom of sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown("""
-    <div style="font-size:0.7rem; color:#505870; line-height:1.4; margin-top:20px;">
+    <div style="font-size:0.7rem; color:#505870; line-height:1.25; margin-top:8px;">
         <strong>Made by:</strong><br>
         Ayan Abbas (sa3421@srmist.edu.in)<br>
-        &<br>
         Shreyan Sarkar (ss4874@srmist.edu.in)<br>
-        <br>
-        <strong>Under the guidance of</strong><br>
-        V. Jayanthi (jayanthv4@srmist.edu.in)
+        <strong>Guide:</strong> V. Jayanthi (jayanthv4@srmist.edu.in)
     </div>
     """, unsafe_allow_html=True)
 

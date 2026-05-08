@@ -1,6 +1,8 @@
 import re
 import time
 import logging
+import os
+from pathlib import Path
 import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
 import pandas as pd
@@ -19,6 +21,36 @@ log = logging.getLogger("eiot")
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 pw = "AyansDataBase"
 
+def _pick_ssl_ca_path() -> str | None:
+    """Pick an RDS CA bundle path that works on both Windows + Linux.
+
+    Order:
+    1) EIOT_SSL_CA env var
+    2) common local dev path (Windows)
+    3) repo-local certs/global-bundle.pem
+    4) common server path (/opt/eiot/certs/global-bundle.pem)
+    """
+    candidates: list[str] = []
+
+    env_path = os.getenv("EIOT_SSL_CA")
+    if env_path:
+        candidates.append(env_path)
+
+    candidates.append("C:/certs/global-bundle.pem")
+    candidates.append(str((Path(__file__).resolve().parent.parent / "certs" / "global-bundle.pem")))
+    candidates.append("/opt/eiot/certs/global-bundle.pem")
+
+    for path in candidates:
+        try:
+            if path and Path(path).exists():
+                return path
+        except Exception:
+            continue
+
+    # Return the first candidate even if missing (mysql-connector will error clearly);
+    # better than silently disabling SSL.
+    return candidates[0] if candidates else None
+
 _DB_CONFIG = {
     "host":         "eiot.c7eqmkyyitqo.ap-south-1.rds.amazonaws.com",
     "port":         3306,
@@ -26,7 +58,7 @@ _DB_CONFIG = {
     "user":         "admin",
     "password":     pw,
     "ssl_disabled": False,
-    "ssl_ca":       "C:/certs/global-bundle.pem",
+    "ssl_ca":       _pick_ssl_ca_path(),
 }
 
 _POWER_HISTORY_LIMIT = 500
